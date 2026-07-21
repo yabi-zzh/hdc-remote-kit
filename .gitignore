@@ -1,0 +1,23 @@
+# 构建产物
+/bin/
+/dist/
+/hdc-remote
+/hdc-remote-kit
+*.exe
+*.exe~
+*.test
+*.out
+
+# IDE 与本地环境
+.idea/
+.vscode/
+.DS_Store
+
+# 运行时状态与日志（不入库，进程启动后按设备事实重建）
+/data/
+*.log
+
+# 二进制测试资产（签名安装包等不入库）
+*.hap
+*.hsp
+*.app

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试与静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+      - name: 检查 gofmt 格式
+        run: |
+          unformatted=$(gofmt -l internal cmd)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未通过 gofmt："
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: 构建
+        run: go build ./...
+      - name: 测试（race 检测 + 覆盖率）
+        run: go test -race -coverprofile=coverage.out ./...
+
+  cross-build:
+    name: 交叉编译
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+      - name: 构建 ${{ matrix.target.goos }}/${{ matrix.target.goarch }}
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: go build ./cmd/hdc-remote

@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 交叉编译并发布
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+      - name: 从 CHANGELOG 生成 Release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 .github/scripts/extract_release_notes.py "$VERSION" \
+            --repo "${{ github.repository }}" \
+            -o release-notes.md
+      - name: 交叉编译全部平台
+        run: make release VERSION=${{ github.ref_name }}
+      - name: 生成 SHA256 校验和
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+      - name: 创建 GitHub Release 并上传产物
+        uses: softprops/action-gh-release@v2
+        with:
+          name: hdc-remote ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/*
