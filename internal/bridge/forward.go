@@ -21,6 +21,12 @@ const (
 	forwardContextBytes = 4
 	forwardBufferBytes  = 64 * 1024
 	forwardOutputBytes  = 4 * 1024
+	// forwardCleanupTimeout 是尽力删除设备侧转发规则的超时。
+	// 这段清理跑在 closeWg 里、且刻意脱离连接 context，用 setupTimeout（默认 10 分钟）
+	// 会让一次连接拆除最久卡上十分钟，因此单独给一个短超时。
+	forwardCleanupTimeout = 5 * time.Second
+	// forwardCleanupDrainBytes 是清理命令输出的丢弃上限，只为读到 channel 结束，不关心内容。
+	forwardCleanupDrainBytes = 64 * 1024
 )
 
 const (
@@ -535,7 +541,7 @@ func (b *forwardBinding) cleanupTargetForward() {
 	if b.owner.openTarget == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(b.owner.ctx), b.owner.setupTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(b.owner.ctx), forwardCleanupTimeout)
 	defer cancel()
 	// 主 HDC 删除转发需完整 ruler（本地端点 + 设备端点），单端点删除会失败并泄漏转发规则。
 	command := "fport rm tcp:" + strconv.Itoa(b.localPort) + " " + b.remoteEndpoint
@@ -543,12 +549,7 @@ func (b *forwardBinding) cleanupTargetForward() {
 	if err != nil {
 		return
 	}
-	defer target.Close()
-	for {
-		if _, err := target.ReadPayload(); err != nil {
-			return
-		}
-	}
+	drainTargetChannel(ctx, target)
 }
 
 type forwardContextKey struct {

@@ -59,11 +59,17 @@ func (s *memoryBindingStore) Save(bindings []model.Binding) error {
 
 type fakeGateway struct {
 	grants      []model.Grant
+	updates     []model.Grant
 	unbindCount int
 }
 
 func (g *fakeGateway) Bind(_ context.Context, grant model.Grant) error {
 	g.grants = append(g.grants, grant)
+	return nil
+}
+
+func (g *fakeGateway) UpdateGrant(grant model.Grant) error {
+	g.updates = append(g.updates, grant)
 	return nil
 }
 
@@ -73,6 +79,51 @@ func (g *fakeGateway) Unbind(string) error {
 }
 
 func (g *fakeGateway) Close() error { return nil }
+
+// TestManagerRenewalPropagatesGrantToGateway 固化租约续期会同步到 listener 的 Grant 快照。
+// 若只刷新 Manager 内的 Lease 而不同步 gateway，设备持续在线满 TTL 后
+// admit 会依据过期快照拒绝所有新连接，且不会自行恢复。
+func TestManagerRenewalPropagatesGrantToGateway(t *testing.T) {
+	cfg := testConfig(t)
+	registry := &fakeRegistry{devices: map[string]model.Device{
+		"node:device": {ID: "node:device", ConnectKey: "device", Transport: model.TransportUSB, Status: model.TargetOnline},
+	}}
+	gateway := &fakeGateway{}
+	manager, err := NewManager(registry, &memoryBindingStore{}, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	manager.SetGateway(gateway)
+	now := time.Unix(100, 0)
+	manager.now = func() time.Time { return now }
+
+	request := model.AcquireRequest{DeviceIdentifier: "node:device", OwnerID: autoOwner, TTL: time.Hour}
+	if _, err := manager.Acquire(context.Background(), request); err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	firstExpiry := gateway.grants[0].ExpiresAt
+
+	now = now.Add(30 * time.Minute)
+	if _, err := manager.Acquire(context.Background(), request); err != nil {
+		t.Fatalf("Acquire(renew) error = %v", err)
+	}
+	if len(gateway.grants) != 1 {
+		t.Fatalf("renewal re-bound the listener: %d binds", len(gateway.grants))
+	}
+	if len(gateway.updates) != 1 {
+		t.Fatalf("renewal did not update the listener grant: %d updates", len(gateway.updates))
+	}
+	renewed := gateway.updates[0]
+	if !renewed.ExpiresAt.After(firstExpiry) {
+		t.Fatalf("renewed grant expiry = %v, want after %v", renewed.ExpiresAt, firstExpiry)
+	}
+	if renewed.Binding.ID != gateway.grants[0].Binding.ID || renewed.LeaseID != gateway.grants[0].LeaseID {
+		t.Fatalf("renewed grant identity drifted: %+v vs %+v", renewed, gateway.grants[0])
+	}
+	if len(renewed.AllowedSourcePrefixes) == 0 || renewed.MaxConnections <= 0 {
+		t.Fatalf("renewed grant lost admission fields: %+v", renewed)
+	}
+}
 
 func TestManagerKeepsStableBindingAcrossLeasesAndRestart(t *testing.T) {
 	cfg := testConfig(t)

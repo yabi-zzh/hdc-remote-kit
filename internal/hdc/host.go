@@ -109,7 +109,9 @@ func (h *HostClient) sendCommand(ctx context.Context, command, connectKey string
 func (h *HostClient) openChannel(ctx context.Context, connectKey string) (net.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, h.connectTimeout)
 	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", h.addr)
+	// 开启 keepalive：OpenTarget 会为流式命令永久清除读写 deadline，
+	// 主 HDC 若未发 FIN 就消失（进程被杀、主机休眠），读循环会永远阻塞并占住 fd。
+	conn, err := (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(dialCtx, "tcp", h.addr)
 	if err != nil {
 		return nil, fmt.Errorf("connect HDC host %s: %w", h.addr, err)
 	}

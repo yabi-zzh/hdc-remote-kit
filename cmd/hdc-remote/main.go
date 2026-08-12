@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/yabi-zzh/hdc-remote-kit/internal/audit"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/config"
@@ -83,6 +82,11 @@ func main() {
 		"allowed_source_cidrs", strings.Join(cfg.AllowedSourceCIDRs, ","),
 		"max_connections", cfg.MaxConnections,
 		"profile", cfg.PolicyProfile)
+	if unrestricted := config.UnrestrictedSourceCIDRs(cfg.AllowedSourceCIDRs); len(unrestricted) > 0 {
+		logger.Warn("allowed_source_cidrs permit every reachable network; any host that can reach this port can debug the attached devices",
+			"cidrs", strings.Join(unrestricted, ","),
+			"hint", "narrow HDC_REMOTE_ALLOWED_SOURCE_CIDRS to the client subnets that actually need access")
+	}
 	if config.PublicHostNeedsSourceCIDRWarn(cfg.PublicHost, cfg.AllowedSourceCIDRs) {
 		logger.Warn("public_host is reachable over LAN but allowed_source_cidrs only allow loopback; remote tconn will be rejected",
 			"public_host", cfg.PublicHost,
@@ -90,17 +94,25 @@ func main() {
 			"hint", "set HDC_REMOTE_ALLOWED_SOURCE_CIDRS to include client LAN, e.g. 192.168.0.0/16")
 	}
 
-	stopSignals := make(chan os.Signal, 1)
+	stopSignals := make(chan os.Signal, 2)
 	signal.Notify(stopSignals, os.Interrupt, syscall.SIGTERM)
 	receivedSignal := <-stopSignals
 	logger.Info("HDC remote service shutdown requested", "signal", receivedSignal)
 
+	// 收尾期间再来一次信号则立即强退。收尾路径上只有 gateway.Close 受 ShutdownTimeout 约束，
+	// 等待对账循环与设备轮询退出都是无限等待，第二次 Ctrl+C 是它们唯一的逃生口。
+	go func() {
+		<-stopSignals
+		logger.Warn("second shutdown signal received, exiting immediately")
+		os.Exit(1)
+	}()
+
 	stopRuntime()
-	// 给后台对账循环一点时间退出后再收尾。
-	time.Sleep(200 * time.Millisecond)
+	// manager.Close 内部会等待对账循环退出，这里不需要靠 sleep 猜时间。
 	if err := manager.Close(); err != nil {
 		logger.Warn("HDC remote service cleanup failed", "error", err)
 	}
+	<-registry.Done()
 	if err := auditSink.Close(); err != nil {
 		logger.Warn("HDC remote audit shutdown failed", "error", err)
 	}

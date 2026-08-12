@@ -75,16 +75,18 @@ debug 下会额外输出：设备扫描刷新、租约续期、主 HDC dial/open
 | `HDC_REMOTE_LEASE_MAX_TTL` | `8h` | 租约保险 TTL（运行期持续刷新；异常停止后到期自动关闭入口） |
 | `HDC_REMOTE_MAX_CONNECTIONS` | `2` | 单设备最大并发连接数 |
 | `HDC_REMOTE_MAX_CHANNELS_PER_CONNECTION` | `64` | 单连接最大同时打开 channel 数 |
+| `HDC_REMOTE_HANDSHAKE_TIMEOUT` | `10s` | 连接建立后完成握手的时限，超时断开以免空连接占用并发名额 |
+| `HDC_REMOTE_SHUTDOWN_TIMEOUT` | `10s` | 退出时等待连接收敛的上限，超时则放弃等待直接退出 |
 | `HDC_REMOTE_HOST_CONNECT_TIMEOUT` | `3s` | 连接主 HDC server 的超时 |
 | `HDC_REMOTE_HOST_READ_TIMEOUT` | `5s` | 主 HDC 读超时（命令流式期间清除） |
 | `HDC_REMOTE_MAX_HOST_PAYLOAD_BYTES` | `1 MiB` | 主 HDC channel 单帧负载上限 |
 | `HDC_REMOTE_MAX_DAEMON_FRAME_BYTES` | `64 MiB` | daemon 单帧大小上限 |
 | `HDC_REMOTE_MAX_FILE_BYTES` | `2 GiB` | 单文件声明大小上限 |
-| `HDC_REMOTE_MAX_TEMP_BYTES` | `4 GiB` | 文件桥临时空间配额 |
+| `HDC_REMOTE_MAX_TEMP_BYTES` | `4 GiB` | 文件桥临时空间配额；`recv` 按 `MAX_FILE_BYTES` 预占，故并发 `recv` 数上限为两者之商（默认 2） |
 | `HDC_REMOTE_FILE_TRANSFER_TIMEOUT` | `10m` | 文件桥主 HDC 传输超时 |
 | `HDC_REMOTE_UNITY_STREAM_TIMEOUT` | `30m` | hilog / JDWP / bugreport 流式桥超时 |
 | `HDC_REMOTE_POLICY_PROFILE` | `studio-debug` | 命令策略档位：`studio-debug` 或更严的 `restricted` |
-| `HDC_REMOTE_EXTRA_DENIED_EXECUTABLES` | 空 | 在内置规则上追加禁止的 shell 可执行名（逗号分隔，仅加严） |
+| `HDC_REMOTE_EXTRA_DENIED_EXECUTABLES` | 空 | 在内置规则上追加禁止的 shell 可执行名（逗号分隔，仅加严）；按小写 basename 归一，写绝对路径同样生效 |
 
 ## 构建与多平台发布
 
@@ -145,7 +147,9 @@ main（装配 + 生命周期）
 - 主信任边界是网络准入：来源 CIDR 白名单（默认 loopback + RFC1918 私网）+ 单设备并发上限 + 租约保险 TTL。只应对可信来源开放。
 - `HDC_REMOTE_PROXY_BIND_HOST` 默认 `0.0.0.0`，实际可达性由来源 CIDR 白名单收敛；放宽白名单前请评估暴露面并配合防火墙。
 - 命令策略（`internal/policy`）是尽力而为的高危黑名单，不是完备沙箱：拦截重启、刷写、remount、删除关键路径等，但不保证挡住所有恶意变体。可用 `HDC_REMOTE_POLICY_PROFILE=restricted` 额外禁网络工具，或用 `HDC_REMOTE_EXTRA_DENIED_EXECUTABLES` 追加禁止项；请勿把本服务直接暴露到不可信网络。
-- 所有命令决策写入 `STATE_DIR/audit.jsonl`，不含文件内容与完整命令行。
+- 策略按 shell 语义解析命令：换行、`;`、`|`、`&&` 等一律视为命令分隔符，引号与反斜杠转义按 shell 规则还原，`sh -c`、`busybox`、`timeout`/`nohup` 等包装器会被展开后再判定。命令位无法静态解析的写法一律拒绝（规则 `indirect-command`），包括 `$(...)` / 反引号 / `$var` 直接作为命令，以及 `... | sh` 这类把命令喂给 shell 的管道——它们可以承载任意命令，放行等于让整张黑名单失效。
+- 为保证 fail-closed，判定偏保守，存在已知误伤：包装器的普通参数也会按可执行名匹配（`nohup cat /tmp/reboot` 会被拦），结束进程的命令与 `hdcd` 出现在同一条命令里即拦（`ps -ef | grep hdcd; kill 1234` 会被拦）。
+- 所有命令决策写入 `STATE_DIR/audit.jsonl`，不含文件内容与完整命令行；单文件超过 64 MiB 自动轮转为 `audit.jsonl.1`，仅保留一代历史，需要长期留存请自行归档。
 
 漏洞报告与更完整说明见 [SECURITY.md](SECURITY.md)。
 

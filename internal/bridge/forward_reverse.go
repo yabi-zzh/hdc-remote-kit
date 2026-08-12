@@ -199,6 +199,13 @@ func (b *ForwardBridge) reverseAcceptLoop(binding *reverseBinding) {
 			_ = conn.Close()
 			return
 		}
+		// contextID 是随机数，重号时直接覆盖会让原来那条连接从 map 里消失：
+		// 它的 socket 与读循环再也没人关得掉，成为永久泄漏。重号则换一个。
+		if _, taken := b.reverseConns[key]; taken {
+			b.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
 		b.reverseConns[key] = reverse
 		b.mu.Unlock()
 		if err := b.write(b.encodeForwardEndpointFrame(binding.channelID, protocol.CommandForwardActiveSlave, key.contextID, binding.hostEndpoint)); err != nil {
@@ -419,19 +426,14 @@ func (r *reverseBinding) cleanupTargetForward() {
 	if r.owner.openTarget == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.owner.ctx), r.owner.setupTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.owner.ctx), forwardCleanupTimeout)
 	defer cancel()
 	command := "fport rm " + r.deviceEndpoint + " tcp:" + strconv.Itoa(r.gatewayPort)
 	target, err := r.owner.openTarget(ctx, command)
 	if err != nil {
 		return
 	}
-	defer target.Close()
-	for {
-		if _, err := target.ReadPayload(); err != nil {
-			return
-		}
-	}
+	drainTargetChannel(ctx, target)
 }
 
 type reverseConn struct {

@@ -73,9 +73,8 @@ func New(cfg config.Config, resolver DeviceResolver, observer ConnectionObserver
 // 返回成功即表示端口已在监听，可对外报告为可连接。
 func (g *Gateway) Bind(ctx context.Context, grant model.Grant) error {
 	binding := grant.Binding
-	if binding.ID == "" || binding.DeviceID == "" || binding.Port <= 0 || binding.Port > 65535 ||
-		grant.LeaseID == "" || grant.MaxConnections <= 0 || len(grant.AllowedSourcePrefixes) == 0 || grant.ExpiresAt.IsZero() {
-		return fmt.Errorf("invalid remote grant")
+	if err := validateGrant(grant); err != nil {
+		return err
 	}
 	g.mu.Lock()
 	if g.closed {
@@ -93,7 +92,10 @@ func (g *Gateway) Bind(ctx context.Context, grant model.Grant) error {
 	if err != nil {
 		return fmt.Errorf("listen remote HDC endpoint %s: %w", address, err)
 	}
-	state := &listenerState{grant: grant, listener: listener, connections: make(map[net.Conn]struct{})}
+	state := &listenerState{
+		bindingID: binding.ID, listener: listener, grant: grant,
+		connections: make(map[net.Conn]struct{}),
+	}
 
 	g.mu.Lock()
 	if g.closed {
@@ -111,6 +113,33 @@ func (g *Gateway) Bind(ctx context.Context, grant model.Grant) error {
 	g.mu.Unlock()
 
 	go g.acceptLoop(state)
+	return nil
+}
+
+func validateGrant(grant model.Grant) error {
+	binding := grant.Binding
+	if binding.ID == "" || binding.DeviceID == "" || binding.Port <= 0 || binding.Port > 65535 ||
+		grant.LeaseID == "" || grant.MaxConnections <= 0 || len(grant.AllowedSourcePrefixes) == 0 || grant.ExpiresAt.IsZero() {
+		return fmt.Errorf("invalid remote grant")
+	}
+	return nil
+}
+
+// UpdateGrant 就地续期已有 listener 的 Grant 快照。listener 在 Bind 时捕获 Grant 副本，
+// admission 全程依据该副本判定，因此租约续期必须同步到这里，
+// 否则设备持续在线满 TTL 后 admit 会开始拒绝所有新连接且不再恢复。
+// 未绑定的 bindingID 视为 no-op（Bind 尚未发生或已 Unbind）。
+func (g *Gateway) UpdateGrant(grant model.Grant) error {
+	if err := validateGrant(grant); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	state := g.listeners[grant.Binding.ID]
+	g.mu.Unlock()
+	if state == nil {
+		return nil
+	}
+	state.updateGrant(grant)
 	return nil
 }
 
@@ -156,8 +185,35 @@ func (g *Gateway) Close() error {
 	for _, state := range states {
 		state.close()
 	}
-	g.wg.Wait()
+	// 有界等待：连接读循环可能正阻塞在向设备侧的写，而 target channel 只在读循环退出后才关闭，
+	// 无限等待会让整个进程停在这里，连第二次 Ctrl+C 也救不回来。
+	if !waitTimeout(&g.wg, g.cfg.ShutdownTimeout) {
+		g.logger.Warn("HDC remote gateway shutdown timed out, exiting with connections still draining",
+			"timeout", g.cfg.ShutdownTimeout)
+		return fmt.Errorf("gateway shutdown timed out after %s with connections still draining", g.cfg.ShutdownTimeout)
+	}
 	return nil
+}
+
+// waitTimeout 等待 wg 归零，超时返回 false。timeout <= 0 表示无限等待。
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	if timeout <= 0 {
+		wg.Wait()
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // acceptLoop 接受某 listener 上的连接，逐个做握手前 admission，通过则起 goroutine 处理，拒绝则上报并关闭。
@@ -167,38 +223,43 @@ func (g *Gateway) acceptLoop(state *listenerState) {
 		conn, err := state.listener.Accept()
 		if err != nil {
 			if !state.isClosed() && !errors.Is(err, net.ErrClosed) {
-				g.logger.Warn("HDC remote accept failed", "binding_id", state.grant.Binding.ID, "error", err)
+				g.logger.Warn("HDC remote accept failed", "binding_id", state.bindingID, "error", err)
 			}
 			return
 		}
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
+			// 交互式 shell 可能长时间无数据，不能用应用层空闲超时回收；
+			// 靠 TCP keepalive 识别对端崩溃/掉线留下的半开连接，避免其长期占用并发名额。
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
-		if accepted, reason := state.admit(conn, time.Now().UTC()); !accepted {
+		grant, accepted, reason := state.admit(conn, time.Now().UTC())
+		if !accepted {
 			g.logger.Warn("connection rejected",
-				"serial", model.DeviceSerial(state.grant.Binding.DeviceID),
+				"serial", model.DeviceSerial(grant.Binding.DeviceID),
 				"remote", conn.RemoteAddr().String(),
 				"reason", reason)
 			if g.observer != nil {
-				g.observer.ConnectionRejected(state.grant.LeaseID, reason)
+				g.observer.ConnectionRejected(grant.LeaseID, reason)
 			}
 			_ = conn.Close()
 			continue
 		}
 		g.logger.Info("connection accepted",
-			"serial", model.DeviceSerial(state.grant.Binding.DeviceID),
+			"serial", model.DeviceSerial(grant.Binding.DeviceID),
 			"remote", conn.RemoteAddr().String())
 		if g.observer != nil {
-			g.observer.ConnectionOpened(state.grant.LeaseID)
+			g.observer.ConnectionOpened(grant.LeaseID)
 		}
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()
 			defer state.removeConnection(conn)
 			if g.observer != nil {
-				defer g.observer.ConnectionClosed(state.grant.LeaseID)
+				defer g.observer.ConnectionClosed(grant.LeaseID)
 			}
-			g.handleConnection(state.grant, conn)
+			g.handleConnection(grant, conn)
 		}()
 	}
 }
@@ -211,16 +272,17 @@ func (g *Gateway) handleConnection(grant model.Grant, conn net.Conn) {
 	remote := &daemonConnection{
 		ctx: ctx, cancel: cancel, conn: conn, binding: binding,
 		resolver: g.resolver, host: g.host, codec: g.codec, logger: g.logger,
-		recorder:      g.recorder,
-		leaseID:       grant.LeaseID,
-		ownerID:       grant.OwnerID,
-		sourceIP:      sourceIP(conn.RemoteAddr()),
-		connectionID:  newConnectionID(),
-		shells:        make(map[uint32]*shellSession),
-		openChannels:  make(map[uint32]struct{}),
-		maxChannels:   g.cfg.MaxChannelsPerConnection,
-		policyEngine:  g.policyEngine,
-		policyProfile: policy.Profile(grant.PolicyProfile),
+		recorder:         g.recorder,
+		leaseID:          grant.LeaseID,
+		ownerID:          grant.OwnerID,
+		sourceIP:         sourceIP(conn.RemoteAddr()),
+		connectionID:     newConnectionID(),
+		shells:           make(map[uint32]*shellSession),
+		openChannels:     make(map[uint32]struct{}),
+		maxChannels:      g.cfg.MaxChannelsPerConnection,
+		handshakeTimeout: g.cfg.HandshakeTimeout,
+		policyEngine:     g.policyEngine,
+		policyProfile:    policy.Profile(grant.PolicyProfile),
 	}
 	fileTempRoot := filepath.Join(g.cfg.StateDir, "transfers")
 	tempStore, err := g.transferTempStore(fileTempRoot)
@@ -269,33 +331,43 @@ func (g *Gateway) handleConnection(grant model.Grant, conn net.Conn) {
 }
 
 type listenerState struct {
-	grant    model.Grant
-	listener net.Listener
+	bindingID string // 不可变，等于 grant.Binding.ID，供无需快照的日志路径使用
+	listener  net.Listener
 
 	mu          sync.Mutex
+	grant       model.Grant // 随租约续期更新，只能经 currentGrant / updateGrant 访问
 	connections map[net.Conn]struct{}
 	closed      bool
 }
 
+func (s *listenerState) updateGrant(grant model.Grant) {
+	s.mu.Lock()
+	s.grant = grant
+	s.mu.Unlock()
+}
+
 // admit 是握手前准入判定：租约未过期、来源 IP 在白名单、未超并发上限，通过则原子占用一个并发名额。
-func (s *listenerState) admit(conn net.Conn, now time.Time) (bool, string) {
+// 一并返回本次判定所依据的 Grant 快照，供调用方在同一条连接上复用——
+// 分两次取快照的话，中间发生的续期会让准入与后续处理依据不同版本的 Grant。
+func (s *listenerState) admit(conn net.Conn, now time.Time) (model.Grant, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	grant := s.grant
 	if s.closed {
-		return false, "Remote access is closed."
+		return grant, false, "Remote access is closed."
 	}
-	if !now.Before(s.grant.ExpiresAt) {
-		return false, "Remote access lease has expired."
+	if !now.Before(grant.ExpiresAt) {
+		return grant, false, "Remote access lease has expired."
 	}
 	address, err := remoteAddress(conn.RemoteAddr())
-	if err != nil || !prefixesContain(s.grant.AllowedSourcePrefixes, address) {
-		return false, "Source IP is not allowed."
+	if err != nil || !prefixesContain(grant.AllowedSourcePrefixes, address) {
+		return grant, false, "Source IP is not allowed."
 	}
-	if len(s.connections) >= s.grant.MaxConnections {
-		return false, "Remote access connection limit was reached."
+	if len(s.connections) >= grant.MaxConnections {
+		return grant, false, "Remote access connection limit was reached."
 	}
 	s.connections[conn] = struct{}{}
-	return true, ""
+	return grant, true, ""
 }
 
 func (s *listenerState) removeConnection(conn net.Conn) {
@@ -381,6 +453,7 @@ type daemonConnection struct {
 
 	writeMu           sync.Mutex
 	handshakeAccepted bool
+	handshakeTimeout  time.Duration
 	policyEngine      *policy.Policy
 	policyProfile     policy.Profile
 	channelMu         sync.Mutex
@@ -398,7 +471,21 @@ type daemonConnection struct {
 // run 是连接主循环：逐帧读取、解码、路由；协议违规立即回错并终止连接，普通命令失败仅回错不断连。
 func (c *daemonConnection) run() {
 	defer c.close()
+	// 握手前设读超时：只连上却不发握手的连接会一直占着并发名额，
+	// 而 MaxConnections 默认只有 2，两条空闲连接就能让设备无法再被调试。
+	deadlineArmed := false
+	if c.handshakeTimeout > 0 {
+		if err := c.conn.SetReadDeadline(time.Now().Add(c.handshakeTimeout)); err == nil {
+			deadlineArmed = true
+		}
+	}
 	for {
+		// 握手完成后撤掉读超时：交互式 shell 可能长时间无输入，
+		// 掉线的对端由 TCP keepalive 回收，不能用应用层超时误杀。
+		if deadlineArmed && c.handshakeAccepted {
+			_ = c.conn.SetReadDeadline(time.Time{})
+			deadlineArmed = false
+		}
 		rawFrame, err := c.codec.ReadFrame(c.conn)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
@@ -477,7 +564,7 @@ func (c *daemonConnection) route(frame protocol.Frame) error {
 				"serial", model.DeviceSerial(c.binding.DeviceID), "command", frame.CommandName, "rule", decision.Rule)
 		}
 		c.audit(frame, model.AuditRejected, decision.Rule)
-		return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, decision.Reason))
+		return c.rejectChannel(frame.ChannelID, decision.Reason)
 	}
 	if !c.admitChannel(frame.CommandFlag, frame.ChannelID) {
 		c.audit(frame, model.AuditRejected, "channel limit reached")
@@ -493,26 +580,26 @@ func (c *daemonConnection) route(frame protocol.Frame) error {
 		return c.handleShell(frame)
 	case protocol.FamilyFile:
 		if c.fileBridge == nil {
-			return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, "File transfer is unavailable."))
+			return c.rejectChannel(frame.ChannelID, "File transfer is unavailable.")
 		}
 		return c.fileBridge.Handle(frame)
 	case protocol.FamilyUnity:
 		if c.unityBridge == nil {
-			return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, "Unity command is unavailable."))
+			return c.rejectChannel(frame.ChannelID, "Unity command is unavailable.")
 		}
 		return c.unityBridge.Handle(frame)
 	case protocol.FamilyApp:
-		if c.appBridge != nil {
-			return c.appBridge.Handle(frame)
+		if c.appBridge == nil {
+			return c.rejectChannel(frame.ChannelID, "App command is unavailable.")
 		}
-		return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, "App command is unavailable."))
+		return c.appBridge.Handle(frame)
 	case protocol.FamilyForward:
 		if c.forwardBridge == nil {
-			return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, "Forward command is unavailable."))
+			return c.rejectChannel(frame.ChannelID, "Forward command is unavailable.")
 		}
 		return c.forwardBridge.Handle(frame)
 	default:
-		return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, "Command is not supported."))
+		return c.rejectChannel(frame.ChannelID, "Command is not supported.")
 	}
 }
 
@@ -534,20 +621,7 @@ func (c *daemonConnection) handleKernel(frame protocol.Frame) error {
 		response = append(response, c.codec.EncodeChannelClose(frame.ChannelID)...)
 		return c.write(response)
 	case protocol.CommandKernelChannelClose:
-		c.untrackChannel(frame.ChannelID)
-		c.stopShell(frame.ChannelID, true)
-		if c.fileBridge != nil {
-			c.fileBridge.CloseChannel(frame.ChannelID)
-		}
-		if c.unityBridge != nil {
-			c.unityBridge.CloseChannel(frame.ChannelID)
-		}
-		if c.appBridge != nil {
-			c.appBridge.CloseChannel(frame.ChannelID)
-		}
-		if c.forwardBridge != nil {
-			c.forwardBridge.CloseChannel(frame.ChannelID)
-		}
+		c.teardownChannel(frame.ChannelID)
 		return c.write(c.codec.EncodeChannelCloseResponse(frame.ChannelID, frame.Payload))
 	case protocol.CommandKernelEcho, protocol.CommandKernelEchoRaw, protocol.CommandKernelEnableKeepalive,
 		protocol.CommandKernelWakeupSlaveTask, protocol.CommandCheckServer, protocol.CommandCheckDevice, protocol.CommandWaitFor:
@@ -570,11 +644,14 @@ func (c *daemonConnection) handleShell(frame protocol.Frame) error {
 			return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, "Shell session is not available."))
 		}
 		// 交互式 stdin 按 channel 累积再检查，识别被拆到多帧的高危命令。
-		guarded := c.appendShellInput(frame.ChannelID, frame.Payload)
+		guarded, ok := c.appendShellInput(frame.ChannelID, frame.Payload)
+		if !ok {
+			c.audit(frame, model.AuditRejected, "shell input too large")
+			return c.rejectChannel(frame.ChannelID, "Shell input is too large.")
+		}
 		if decision := c.policyOrDefault().InspectShell(c.policyProfile, guarded); !decision.Allowed {
 			c.audit(frame, model.AuditRejected, decision.Rule)
-			c.stopShell(frame.ChannelID, true)
-			return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, decision.Reason))
+			return c.rejectChannel(frame.ChannelID, decision.Reason)
 		}
 		return session.target.WritePayload(frame.Payload)
 	case protocol.CommandUnityExecute, protocol.CommandUnityExecuteEx:
@@ -584,11 +661,14 @@ func (c *daemonConnection) handleShell(frame protocol.Frame) error {
 				return nil
 			}
 			// 已有交互 session 时，UnityExecute 视作 stdin，同样累积跨帧检查。
-			guarded := c.appendShellInput(frame.ChannelID, []byte(command))
+			guarded, ok := c.appendShellInput(frame.ChannelID, []byte(command))
+			if !ok {
+				c.audit(frame, model.AuditRejected, "shell input too large")
+				return c.rejectChannel(frame.ChannelID, "Shell input is too large.")
+			}
 			if decision := c.policyOrDefault().InspectShell(c.policyProfile, guarded); !decision.Allowed {
 				c.audit(frame, model.AuditRejected, decision.Rule)
-				c.stopShell(frame.ChannelID, true)
-				return c.write(c.codec.EncodeEchoAndClose(frame.ChannelID, decision.Reason))
+				return c.rejectChannel(frame.ChannelID, decision.Reason)
 			}
 			c.audit(frame, model.AuditAllowed, "")
 			return session.target.WritePayload([]byte(command))
@@ -666,12 +746,25 @@ func (c *daemonConnection) getShell(channelID uint32) *shellSession {
 	return c.shells[channelID]
 }
 
-// shellInputGuardLimit 是交互式 shell 输入护栏的滑动窗口上限（字节）。
-const shellInputGuardLimit = 4096
+const (
+	// shellInputGuardLimit 是跨帧保留的残行上限（字节）：一行输入超过它就只保留尾部。
+	shellInputGuardLimit = 4096
+	// shellInputInspectLimit 是单次判定文本的上限（字节）。本帧送达设备的输入必须整体过检，
+	// 只截取尾部会让「大段填充 + 高危命令」把命令挤出窗口从而绕过判定，
+	// 因此超限时拒绝该帧（fail-closed），而不是缩小检查范围。
+	//
+	// 注意这个「整体过检」只对单行长度不超过 shellInputGuardLimit 的输入成立：
+	// 一直不换行的超长输入会按下面的规则截尾，其行首部分不会带入后续帧的判定。
+	shellInputInspectLimit = 256 * 1024
+)
 
-// appendShellInput 按 channel 累积交互式 stdin 并返回窗口内累积文本，
-// 用于识别被拆到多帧发送的高危命令。
-func (c *daemonConnection) appendShellInput(channelID uint32, chunk []byte) string {
+// appendShellInput 按 channel 累积交互式 stdin，返回本次需要判定的全部文本。
+// 返回的文本覆盖本帧会送达设备的所有输入，加上此前尚未以换行结束的残行，
+// 因此能识别被拆到多帧发送的高危命令。第二个返回值为 false 表示输入超限、应拒绝该帧。
+//
+// 换行之后的内容才需要留到下一帧：换行是命令分隔符，已成行的输入在到达时就判定过了。
+// 不保留已判定的历史，交互会话每次按键的判定成本才不会随会话长度增长。
+func (c *daemonConnection) appendShellInput(channelID uint32, chunk []byte) (string, bool) {
 	c.shellMu.Lock()
 	defer c.shellMu.Unlock()
 	if c.shellInput == nil {
@@ -682,14 +775,26 @@ func (c *daemonConnection) appendShellInput(channelID uint32, chunk []byte) stri
 		buffer = &strings.Builder{}
 		c.shellInput[channelID] = buffer
 	}
-	buffer.WriteString(string(chunk))
-	if buffer.Len() > shellInputGuardLimit {
-		// 只保留最近的窗口，避免长交互 session 无界增长，同时仍能识别跨帧拼接的命令。
-		trimmed := buffer.String()[buffer.Len()-shellInputGuardLimit:]
+	if buffer.Len()+len(chunk) > shellInputInspectLimit {
 		buffer.Reset()
-		buffer.WriteString(trimmed)
+		return "", false
 	}
-	return buffer.String()
+	buffer.Write(chunk)
+	guarded := buffer.String()
+
+	retained := guarded
+	if index := strings.LastIndexAny(retained, "\r\n"); index >= 0 {
+		retained = retained[index+1:]
+	}
+	if len(retained) > shellInputGuardLimit {
+		// 一直没有换行的超长输入：保留尾部，避免残行无界增长。
+		retained = retained[len(retained)-shellInputGuardLimit:]
+	}
+	if len(retained) != len(guarded) {
+		buffer.Reset()
+		buffer.WriteString(retained)
+	}
+	return guarded, true
 }
 
 func (c *daemonConnection) stopShell(channelID uint32, byUs bool) {
@@ -703,13 +808,22 @@ func (c *daemonConnection) stopShell(channelID uint32, byUs bool) {
 	}
 }
 
+// removeShell 在设备侧 shell 结束（一次性命令跑完或交互退出）时清理会话。
+// 名额也要在这里释放：这条路径不经过客户端的 ChannelClose，
+// 只靠客户端回送来释放的话，一次性命令跑满 MaxChannelsPerConnection 次就会把连接卡死。
 func (c *daemonConnection) removeShell(channelID uint32, session *shellSession) {
 	c.shellMu.Lock()
-	if c.shells[channelID] == session {
+	current := c.shells[channelID] == session
+	if current {
 		delete(c.shells, channelID)
 		delete(c.shellInput, channelID)
 	}
 	c.shellMu.Unlock()
+	// 只有当结束的确实是该 channel 上的当前会话时才释放名额。
+	// 旧会话的收尾若无条件释放，会把同一 channelID 上新会话占的名额一并放掉。
+	if current {
+		c.untrackChannel(channelID)
+	}
 }
 
 // policyOrDefault 返回连接的命令策略实例；未注入时回退默认策略（供单测直接构造连接的场景）。
@@ -747,6 +861,34 @@ func (c *daemonConnection) untrackChannel(channelID uint32) {
 	c.channelMu.Lock()
 	delete(c.openChannels, channelID)
 	c.channelMu.Unlock()
+}
+
+// teardownChannel 拆除一个 channel 上的全部会话并释放其名额。
+// 客户端主动关闭与本端回错关闭都走这里，保证「告诉对端 channel 已关」与
+// 「本端真的把它拆干净」始终一致——只释放名额却留着会话，
+// 等于把名额上限变成可以反复绕过的计数器。
+func (c *daemonConnection) teardownChannel(channelID uint32) {
+	c.untrackChannel(channelID)
+	c.stopShell(channelID, true)
+	if c.fileBridge != nil {
+		c.fileBridge.CloseChannel(channelID)
+	}
+	if c.unityBridge != nil {
+		c.unityBridge.CloseChannel(channelID)
+	}
+	if c.appBridge != nil {
+		c.appBridge.CloseChannel(channelID)
+	}
+	if c.forwardBridge != nil {
+		c.forwardBridge.CloseChannel(channelID)
+	}
+}
+
+// rejectChannel 回错并关闭该 channel：先拆除其上的会话再释放名额。
+// 名额若只在客户端回送 ChannelClose 时释放，客户端不回送就会一路累积到上限把整条连接卡死。
+func (c *daemonConnection) rejectChannel(channelID uint32, message string) error {
+	c.teardownChannel(channelID)
+	return c.write(c.codec.EncodeEchoAndClose(channelID, message))
 }
 
 func (c *daemonConnection) write(payload []byte) error {

@@ -59,3 +59,38 @@ func TestRegistryProjectsOfflineAndStaleStates(t *testing.T) {
 		t.Fatalf("stale device status = %s", device.Status)
 	}
 }
+
+// TestRegistryEvictsLongOfflineDevices 确认持续离线的设备最终被移出快照，
+// 且中途的扫描失败（markStale）不会把淘汰计时清零。
+func TestRegistryEvictsLongOfflineDevices(t *testing.T) {
+	now := time.Unix(100, 0)
+	online := []model.Device{{ID: "node:device", ConnectKey: "device", Transport: model.TransportUSB, Status: model.TargetOnline}}
+	scanner := &sequenceScanner{results: []scannerResult{
+		{devices: online},
+		{devices: nil},
+	}}
+	staleAfter := 5 * time.Second
+	registry := NewRegistry(scanner, time.Second, staleAfter, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	registry.now = func() time.Time { return now }
+
+	registry.refresh(context.Background())
+	now = now.Add(time.Second)
+	registry.refresh(context.Background())
+	if _, found := registry.Find("node:device"); !found {
+		t.Fatal("device disappeared immediately after going offline")
+	}
+
+	// 一次扫描失败会把所有设备标记为 UNKNOWN 并刷新 UpdatedAt；淘汰计时不应因此重置。
+	scanner.results = append(scanner.results, scannerResult{err: errors.New("HDC unavailable")})
+	scanner.index = len(scanner.results) - 1
+	now = now.Add(staleAfter + time.Second)
+	registry.refresh(context.Background())
+
+	scanner.results = []scannerResult{{devices: nil}}
+	scanner.index = 0
+	now = now.Add(registry.retainOffline)
+	registry.refresh(context.Background())
+	if _, found := registry.Find("node:device"); found {
+		t.Fatal("device still present after the offline retention window elapsed")
+	}
+}

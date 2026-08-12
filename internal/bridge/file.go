@@ -19,6 +19,8 @@ import (
 const (
 	fileFinishAll         = byte(0)
 	fileFinishCurrentFile = byte(1)
+	// fileOutputLimit 是主 HDC 命令输出的采集上限，仅用于识别失败标记。
+	fileOutputLimit = 4 * 1024
 )
 
 const (
@@ -164,6 +166,7 @@ func (b *FileBridge) handleCheck(frame protocol.Frame) error {
 	upload := &fileUpload{
 		channelID:    frame.ChannelID,
 		targetPath:   config.Path,
+		optionalName: strings.TrimSpace(config.OptionalName),
 		expectedSize: fileSize,
 		allocation:   allocation,
 	}
@@ -234,7 +237,7 @@ func (b *FileBridge) runTargetUpload(upload *fileUpload) {
 		b.finishUpload(upload, failFileTransfer, false)
 		return
 	}
-	target, err := b.openTarget(ctx, buildFileSendCommand(upload.allocation.path, upload.targetPath))
+	target, err := b.openTarget(ctx, buildFileSendCommand(upload.allocation.currentPath(), upload.targetPath))
 	if err != nil {
 		b.finishUpload(upload, failFileTransfer, false)
 		return
@@ -243,6 +246,7 @@ func (b *FileBridge) runTargetUpload(upload *fileUpload) {
 		_ = target.Close()
 		return
 	}
+	defer closeOnContext(ctx, upload.close)()
 
 	outputSeen := false
 	for {
@@ -286,7 +290,7 @@ func (b *FileBridge) handleRecvInit(frame protocol.Frame) error {
 	if message != "" {
 		return b.reject(frame.ChannelID, message)
 	}
-	allocation, err := b.tempStore.prepareDownload()
+	allocation, err := b.tempStore.prepareDownload(b.maxFileBytes)
 	if err != nil {
 		return b.reject(frame.ChannelID, failFileTransfer)
 	}
@@ -316,23 +320,29 @@ func (b *FileBridge) runTargetDownload(download *fileDownload) {
 	ctx, cancel := context.WithTimeout(b.ctx, b.timeout)
 	defer cancel()
 	if b.openTarget == nil {
-		_ = b.failDownload(download, failFileTransfer)
+		b.failDownload(download, failFileTransfer)
 		return
 	}
-	target, err := b.openTarget(ctx, buildFileRecvCommand(download.devicePath, download.allocation.path))
+	temporaryPath := download.allocation.currentPath()
+	target, err := b.openTarget(ctx, buildFileRecvCommand(download.devicePath, temporaryPath))
 	if err != nil {
-		_ = b.failDownload(download, failFileTransfer)
+		b.failDownload(download, failFileTransfer)
 		return
 	}
 	if !download.attachTarget(target) {
 		_ = target.Close()
 		return
 	}
+	defer closeOnContext(ctx, download.close)()
+	// 主 HDC 直接把设备文件写到临时路径，写入量不受本进程控制；
+	// 只在写完后查大小的话，一个超大设备文件会先把本机磁盘写满再被拒绝。
+	stopSizeGuard := watchTempFileSize(ctx, temporaryPath, b.maxFileBytes, download.close)
+	defer stopSizeGuard()
 
 	var output strings.Builder
 	for {
 		payload, readErr := target.ReadPayload()
-		if len(payload) > 0 && output.Len() < 4096 {
+		if len(payload) > 0 && output.Len() < fileOutputLimit {
 			output.Write(payload)
 		}
 		if readErr != nil {
@@ -340,27 +350,24 @@ func (b *FileBridge) runTargetDownload(download *fileDownload) {
 		}
 	}
 	_ = target.Close()
+	stopSizeGuard()
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		_ = b.failDownload(download, failFileTransferTimeout)
+		b.failDownload(download, failFileTransferTimeout)
 		return
 	}
 	if strings.Contains(strings.ToLower(output.String()), "[fail]") {
-		_ = b.failDownload(download, failFileTransfer)
+		b.failDownload(download, failFileTransfer)
 		return
 	}
-	info, statErr := os.Stat(download.allocation.path)
+	info, statErr := os.Stat(temporaryPath)
 	if statErr != nil {
-		_ = b.failDownload(download, failFileNoResult)
+		b.failDownload(download, failFileNoResult)
 		return
 	}
 	size := info.Size()
 	if size > b.maxFileBytes {
-		_ = b.failDownload(download, failFileTransfer)
-		return
-	}
-	if err := b.tempStore.account(size); err != nil {
-		_ = b.failDownload(download, failFileTransfer)
+		b.failDownload(download, failFileTransfer)
 		return
 	}
 	download.setSize(size)
@@ -370,26 +377,42 @@ func (b *FileBridge) runTargetDownload(download *fileDownload) {
 		OptionalName: download.optionalName, Compression: protocol.CompressionNone,
 	}
 	if err := b.write(b.codec.EncodeFrame(download.channelID, protocol.CommandFileCheck, protocol.EncodeTransferConfig(config))); err != nil {
-		_ = b.failDownload(download, "")
+		b.failDownload(download, "")
 	}
 }
 
 // handleRecvBegin 收到用户(slave) 的 CMD_FILE_BEGIN 后，开始分片回放临时文件。
+//
+// 回放放到独立 goroutine 执行：单个文件最大可达 MAX_FILE_BYTES，若在连接的读协程上同步跑完，
+// 这条连接在整个传输期间都无法再处理任何帧——ChannelClose、keepalive、其它 channel 的命令全部阻塞，
+// 用户连取消传输都做不到。其余 bridge 的数据通路同样是独立 goroutine。
 func (b *FileBridge) handleRecvBegin(frame protocol.Frame) error {
 	download := b.getDownload(frame.ChannelID)
 	if download == nil {
 		return b.reject(frame.ChannelID, failInvalidFileRequest)
 	}
-	return b.sendDownloadData(download)
-}
-
-func (b *FileBridge) sendDownloadData(download *fileDownload) error {
 	if !download.beginSending() {
 		return nil
 	}
-	file, err := os.Open(download.allocation.path)
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closeWg.Add(1)
+	b.mu.Unlock()
+	go func() {
+		defer b.closeWg.Done()
+		b.sendDownloadData(download)
+	}()
+	return nil
+}
+
+func (b *FileBridge) sendDownloadData(download *fileDownload) {
+	file, err := os.Open(download.allocation.currentPath())
 	if err != nil {
-		return b.failDownload(download, failFileTransfer)
+		b.failDownload(download, failFileTransfer)
+		return
 	}
 	defer file.Close()
 
@@ -397,6 +420,10 @@ func (b *FileBridge) sendDownloadData(download *fileDownload) error {
 	buffer := make([]byte, chunkSize)
 	var index uint64
 	for {
+		// 客户端关闭 channel 或连接拆除时立刻停手，不必把剩余文件写完。
+		if download.isClosed() {
+			return
+		}
 		count, readErr := file.Read(buffer)
 		if count > 0 {
 			header := protocol.TransferPayload{
@@ -405,10 +432,12 @@ func (b *FileBridge) sendDownloadData(download *fileDownload) error {
 			}
 			dataPayload, encErr := protocol.EncodeTransferData(header, buffer[:count])
 			if encErr != nil {
-				return b.failDownload(download, failFileTransfer)
+				b.failDownload(download, failFileTransfer)
+				return
 			}
 			if err := b.write(b.codec.EncodeFrame(download.channelID, protocol.CommandFileData, dataPayload)); err != nil {
-				return b.failDownload(download, "")
+				b.failDownload(download, "")
+				return
 			}
 			index += uint64(count)
 		}
@@ -416,11 +445,11 @@ func (b *FileBridge) sendDownloadData(download *fileDownload) error {
 			break
 		}
 		if readErr != nil {
-			return b.failDownload(download, failFileTransfer)
+			b.failDownload(download, failFileTransfer)
+			return
 		}
 	}
 	// 数据发送完毕；等待用户(slave) 写满后回 CMD_FILE_FINISH(1)。
-	return nil
 }
 
 // handleRecvFinish 收到用户(slave) 的 FINISH(1)，回 FINISH(0) 并结束会话（master 侧握手）。
@@ -432,9 +461,8 @@ func (b *FileBridge) handleRecvFinish(frame protocol.Frame, download *fileDownlo
 	return nil
 }
 
-func (b *FileBridge) failDownload(download *fileDownload, message string) error {
+func (b *FileBridge) failDownload(download *fileDownload, message string) {
 	b.endDownload(download, message)
-	return nil
 }
 
 func (b *FileBridge) endDownload(download *fileDownload, message string) {
@@ -526,6 +554,7 @@ func (b *FileBridge) removeUpload(channelID uint32, expected *fileUpload) *fileU
 type fileUpload struct {
 	channelID    uint32
 	targetPath   string
+	optionalName string
 	expectedSize int64
 	allocation   *tempAllocation
 
@@ -546,7 +575,7 @@ func (u *fileUpload) writeChunk(index uint64, data []byte) (bool, error) {
 	if int64(len(data)) > u.expectedSize-u.receivedSize {
 		return false, fmt.Errorf("file transfer exceeds declared size")
 	}
-	written, err := u.allocation.file.Write(data)
+	written, err := u.allocation.write(data)
 	if err != nil {
 		return false, err
 	}
@@ -565,6 +594,13 @@ func (u *fileUpload) prepareTargetTransfer() error {
 	}
 	if err := u.allocation.seal(); err != nil {
 		return err
+	}
+	// 目标路径是目录时，设备侧按源文件名落盘；临时文件默认名是 "payload"，
+	// 不改回客户端声明的文件名就会在设备上写出一个名为 payload 的文件。
+	if u.optionalName != "" {
+		if err := u.allocation.renameToName(u.optionalName); err != nil {
+			return err
+		}
 	}
 	u.transferStarted = true
 	return nil
@@ -622,9 +658,17 @@ func (d *fileDownload) attachTarget(target TargetChannel) bool {
 
 func (d *fileDownload) setSize(size int64) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.fileSize = size
-	d.allocation.size = size // 使 close() 归还正确的配额
+	d.mu.Unlock()
+	// 把 prepareDownload 时按上限预占的配额调整为实际占用。
+	d.allocation.settle(size)
+}
+
+// isClosed 供回放循环在分片之间检查会话是否已被拆除，避免关闭后仍继续写剩余文件。
+func (d *fileDownload) isClosed() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.closed
 }
 
 func (d *fileDownload) beginSending() bool {

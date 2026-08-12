@@ -31,6 +31,8 @@ type Config struct {
 	LeaseMaxTTL              time.Duration // 自动转发租约的保险 TTL，运行期持续刷新；服务异常停止刷新后租约到期自动关闭入口
 	MaxConnections           int
 	MaxChannelsPerConnection int
+	HandshakeTimeout         time.Duration // 已准入连接必须在此时间内完成握手，防止空连接长期占用并发名额
+	ShutdownTimeout          time.Duration // 优雅退出等待连接收敛的上限，超时则放弃等待直接退出
 	HostConnectTimeout       time.Duration
 	HostReadTimeout          time.Duration
 	MaxHostPayloadBytes      int
@@ -77,6 +79,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	durations, err := loadDurations()
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		HDCAddr:       envString("HDC_REMOTE_HDC_ADDR", "127.0.0.1:8710"),
@@ -92,20 +98,22 @@ func Load() (Config, error) {
 			"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		}),
 		LogLevel:                 strings.ToLower(envString("HDC_REMOTE_LOG_LEVEL", "info")),
-		DevicePollInterval:       envDuration("HDC_REMOTE_DEVICE_POLL_INTERVAL", 2*time.Second),
-		DeviceStaleAfter:         envDuration("HDC_REMOTE_DEVICE_STALE_AFTER", 10*time.Second),
-		LeaseMaxTTL:              envDuration("HDC_REMOTE_LEASE_MAX_TTL", 8*time.Hour),
+		DevicePollInterval:       durations.devicePoll,
+		DeviceStaleAfter:         durations.deviceStale,
+		LeaseMaxTTL:              durations.leaseMaxTTL,
 		MaxConnections:           maxConnections,
 		MaxChannelsPerConnection: maxChannels,
-		HostConnectTimeout:       envDuration("HDC_REMOTE_HOST_CONNECT_TIMEOUT", 3*time.Second),
-		HostReadTimeout:          envDuration("HDC_REMOTE_HOST_READ_TIMEOUT", 5*time.Second),
+		HandshakeTimeout:         durations.handshake,
+		ShutdownTimeout:          durations.shutdown,
+		HostConnectTimeout:       durations.hostConnect,
+		HostReadTimeout:          durations.hostRead,
 		MaxHostPayloadBytes:      maxHostPayload,
 		MaxDaemonFrameBytes:      maxDaemonFrame,
 		MaxFileBytes:             maxFileBytes,
 		MaxTempBytes:             maxTempBytes,
-		FileTransferTimeout:      envDuration("HDC_REMOTE_FILE_TRANSFER_TIMEOUT", 10*time.Minute),
-		UnityStreamTimeout:       envDuration("HDC_REMOTE_UNITY_STREAM_TIMEOUT", 30*time.Minute),
-		PolicyProfile:            envString("HDC_REMOTE_POLICY_PROFILE", string(policy.ProfileStudioDebug)),
+		FileTransferTimeout:      durations.fileTransfer,
+		UnityStreamTimeout:       durations.unityStream,
+		PolicyProfile:            strings.ToLower(envString("HDC_REMOTE_POLICY_PROFILE", string(policy.ProfileStudioDebug))),
 		ExtraDeniedExecutables:   envCSV("HDC_REMOTE_EXTRA_DENIED_EXECUTABLES", nil),
 	}
 	if err := validate(cfg); err != nil {
@@ -128,6 +136,9 @@ func validate(cfg Config) error {
 	if cfg.HostConnectTimeout <= 0 || cfg.HostReadTimeout <= 0 || cfg.DevicePollInterval <= 0 ||
 		cfg.DeviceStaleAfter < cfg.DevicePollInterval {
 		return fmt.Errorf("timeouts and polling intervals are invalid")
+	}
+	if cfg.HandshakeTimeout <= 0 || cfg.ShutdownTimeout <= 0 {
+		return fmt.Errorf("handshake and shutdown timeouts must be positive")
 	}
 	if cfg.LeaseMaxTTL <= 0 {
 		return fmt.Errorf("lease TTL must be positive")
@@ -170,6 +181,22 @@ func ParseLogLevel(value string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("invalid log level %q (want debug|info|warn|error)", value)
 	}
+}
+
+// UnrestrictedSourceCIDRs 返回白名单中放行整个地址族的前缀（如 0.0.0.0/0、::/0）。
+// 这类配置会把设备暴露给所有可达网络，必须在启动时显式告警。
+func UnrestrictedSourceCIDRs(cidrs []string) []string {
+	var unrestricted []string
+	for _, cidr := range cidrs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+		if prefix.Bits() == 0 {
+			unrestricted = append(unrestricted, cidr)
+		}
+	}
+	return unrestricted
 }
 
 // PublicHostNeedsSourceCIDRWarn 在展示地址非 loopback、但白名单仅含 loopback 时返回 true。
@@ -225,16 +252,61 @@ func envInt64(name string, fallback int64) (int64, error) {
 	return parsed, nil
 }
 
-func envDuration(name string, fallback time.Duration) time.Duration {
+// durationSettings 汇总所有时长配置，便于一次性解析并让错误指名具体环境变量。
+type durationSettings struct {
+	devicePoll   time.Duration
+	deviceStale  time.Duration
+	leaseMaxTTL  time.Duration
+	handshake    time.Duration
+	shutdown     time.Duration
+	hostConnect  time.Duration
+	hostRead     time.Duration
+	fileTransfer time.Duration
+	unityStream  time.Duration
+}
+
+// durationSpec 把一个时长环境变量绑定到它的默认值与目标字段。
+type durationSpec struct {
+	name     string
+	fallback time.Duration
+	target   *time.Duration
+}
+
+func loadDurations() (durationSettings, error) {
+	var settings durationSettings
+	specs := []durationSpec{
+		{"HDC_REMOTE_DEVICE_POLL_INTERVAL", 2 * time.Second, &settings.devicePoll},
+		{"HDC_REMOTE_DEVICE_STALE_AFTER", 10 * time.Second, &settings.deviceStale},
+		{"HDC_REMOTE_LEASE_MAX_TTL", 8 * time.Hour, &settings.leaseMaxTTL},
+		{"HDC_REMOTE_HANDSHAKE_TIMEOUT", 10 * time.Second, &settings.handshake},
+		{"HDC_REMOTE_SHUTDOWN_TIMEOUT", 10 * time.Second, &settings.shutdown},
+		{"HDC_REMOTE_HOST_CONNECT_TIMEOUT", 3 * time.Second, &settings.hostConnect},
+		{"HDC_REMOTE_HOST_READ_TIMEOUT", 5 * time.Second, &settings.hostRead},
+		{"HDC_REMOTE_FILE_TRANSFER_TIMEOUT", 10 * time.Minute, &settings.fileTransfer},
+		{"HDC_REMOTE_UNITY_STREAM_TIMEOUT", 30 * time.Minute, &settings.unityStream},
+	}
+	for _, spec := range specs {
+		value, err := envDuration(spec.name, spec.fallback)
+		if err != nil {
+			return durationSettings{}, err
+		}
+		*spec.target = value
+	}
+	return settings, nil
+}
+
+// envDuration 解析时长环境变量。解析失败必须报错并指名变量，
+// 否则漏写单位（如 HOST_READ_TIMEOUT=5）会静默变成 0，最后只报一句笼统的校验失败。
+func envDuration(name string, fallback time.Duration) (time.Duration, error) {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
 	parsed, err := time.ParseDuration(value)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("invalid %s: %w", name, err)
 	}
-	return parsed
+	return parsed, nil
 }
 
 func envCSV(name string, fallback []string) []string {

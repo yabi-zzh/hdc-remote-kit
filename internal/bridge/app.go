@@ -327,7 +327,7 @@ func (s *appSession) writeInstallData(payload []byte) error {
 		s.mu.Unlock()
 		return fmt.Errorf("%s", failAppInvalidRequest)
 	}
-	written, writeErr := transfer.allocation.file.WriteAt(data, transfer.receivedSize)
+	written, writeErr := transfer.allocation.writeAt(data, transfer.receivedSize)
 	if writeErr != nil || written != len(data) {
 		s.mu.Unlock()
 		return fmt.Errorf("%s", failAppTransfer)
@@ -351,7 +351,7 @@ func (s *appSession) writeInstallData(payload []byte) error {
 	s.mu.Unlock()
 
 	if completed != nil {
-		command := buildAppInstallCommand(completed.options, completed.allocation.path)
+		command := buildAppInstallCommand(completed.options, completed.allocation.currentPath())
 		if !s.owner.launch(s, appFinishModeInstall, command, completed.allocation) {
 			completed.allocation.close()
 			return fmt.Errorf("%s", failAppCommand)

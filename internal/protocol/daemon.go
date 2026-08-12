@@ -23,8 +23,9 @@ const (
 )
 
 // Frame 是一个已解码的 HDC daemon 协议帧。
+// Payload 指向 Decode 入参的底层数组，不额外复制；调用方若需在本帧处理结束后继续持有，须自行复制。
+// ReadFrame 每次返回独立缓冲，故按「读一帧 → 解一帧 → 处理完」的常规流程使用是安全的。
 type Frame struct {
-	Raw         []byte  // 原始帧字节（保留用于问题追溯）
 	ChannelID   uint32  // 逻辑通道 ID，一条 tconn 连接上多路复用
 	CommandFlag Command // 命令码
 	CommandName string  // 命令码对应的可读名（未知则为 Unknown(n)）
@@ -70,11 +71,14 @@ func (c *Codec) ReadFrame(reader io.Reader) ([]byte, error) {
 	if bodySize > uint64(c.maxFrameBytes-DaemonHeaderBytes) {
 		return nil, fmt.Errorf("HDC daemon frame size is invalid: %d", bodySize)
 	}
-	body := make([]byte, int(bodySize))
-	if _, err := io.ReadFull(reader, body); err != nil {
+	// 一次分配出整帧再分段读入：header 容量恰好等于帧头长度，
+	// append(header, body...) 必然再分配一块并复制两次。
+	frame := make([]byte, DaemonHeaderBytes+int(bodySize))
+	copy(frame, header)
+	if _, err := io.ReadFull(reader, frame[DaemonHeaderBytes:]); err != nil {
 		return nil, err
 	}
-	return append(header, body...), nil
+	return frame, nil
 }
 
 // Decode 将 ReadFrame 得到的原始字节解析为 Frame：校验帧头、protect 段 vcode 与 payload 校验和，映射命令名。
@@ -86,7 +90,9 @@ func (c *Codec) Decode(raw []byte) (Frame, error) {
 	if err != nil {
 		return Frame{}, err
 	}
-	if DaemonHeaderBytes+int(protectSize)+int(payloadSize) != len(raw) {
+	// 用 uint64 比较：32 位平台上 int(payloadSize) 会溢出成负数，
+	// 精心构造的长度字段可借此通过校验并让后面的切片越界。
+	if uint64(DaemonHeaderBytes)+uint64(protectSize)+uint64(payloadSize) != uint64(len(raw)) {
 		return Frame{}, fmt.Errorf("invalid HDC daemon frame size")
 	}
 	protect, err := decodeProtect(raw[DaemonHeaderBytes : DaemonHeaderBytes+int(protectSize)])
@@ -106,13 +112,12 @@ func (c *Codec) Decode(raw []byte) (Frame, error) {
 		name = descriptor.Name
 	}
 	return Frame{
-		Raw:         append([]byte(nil), raw...),
 		ChannelID:   protect.ChannelID,
 		CommandFlag: protect.CommandFlag,
 		CommandName: name,
 		CheckSum:    protect.CheckSum,
 		VCode:       protect.VCode,
-		Payload:     append([]byte(nil), payload...),
+		Payload:     payload,
 	}, nil
 }
 
@@ -230,6 +235,11 @@ func (c *Codec) EncodeHandshakeOK(request Frame, requestHandshake SessionHandsha
 	return c.EncodeFrame(request.ChannelID, CommandKernelHandshake, encodeSessionHandshake(response))
 }
 
+// shellControlReplacer 复用同一个 Replacer 实例：strings.NewReplacer 每次调用都会重建匹配结构。
+// 这里把分隔类控制字符统一折叠为空格，且折叠后的命令串既用于策略判定也用于下发设备，
+// 两者一致，不存在「判定看到的」与「设备执行的」不同的问题。
+var shellControlReplacer = strings.NewReplacer("\x00", " ", "\r", " ", "\n", " ")
+
 // ExtractShellCommand 从 UnityExecute/UnityExecuteEx 帧提取一次性 shell 命令字符串，
 // 规范化控制字符并拒绝非可打印 ASCII，作为进入策略检查前的安全清洗。
 func ExtractShellCommand(frame Frame) string {
@@ -242,7 +252,7 @@ func ExtractShellCommand(frame Frame) string {
 	default:
 		return ""
 	}
-	text := strings.TrimSpace(strings.NewReplacer("\x00", " ", "\r", " ", "\n", " ").Replace(string(value)))
+	text := strings.TrimSpace(shellControlReplacer.Replace(string(value)))
 	if !utf8.ValidString(text) {
 		return ""
 	}
@@ -273,7 +283,7 @@ func decodeFrameHeader(header []byte) (uint16, uint32, error) {
 	}
 	protectSize := binary.BigEndian.Uint16(header[5:7])
 	payloadSize := binary.BigEndian.Uint32(header[7:11])
-	if protectSize == 0 || uint64(protectSize)+uint64(payloadSize) == 0 {
+	if protectSize == 0 {
 		return 0, 0, fmt.Errorf("invalid HDC daemon frame size")
 	}
 	return protectSize, payloadSize, nil
@@ -355,10 +365,17 @@ func encodeSessionHandshake(handshake SessionHandshake) []byte {
 	return appendStringField(result, 6, handshake.Version)
 }
 
+// authTLVFieldWidth 是认证成功 TLV 的定宽字段长度；tag 与长度都必须严格占满该宽度，
+// 超长会把后续字段整体挪位，解析端只能读到错乱数据。
+const authTLVFieldWidth = 16
+
 func buildAuthSuccessTLV(deviceName string) string {
 	var builder strings.Builder
 	appendTLV := func(tag, value string) {
-		builder.WriteString(fmt.Sprintf("%-16s%-16d%s", tag, len(value), value))
+		if len(tag) > authTLVFieldWidth {
+			tag = tag[:authTLVFieldWidth]
+		}
+		builder.WriteString(fmt.Sprintf("%-*s%-*d%s", authTLVFieldWidth, tag, authTLVFieldWidth, len(value), value))
 	}
 	appendTLV("emgmsg", "")
 	appendTLV("devname", deviceName)

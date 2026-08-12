@@ -87,36 +87,78 @@ func newTestDaemonConnection(codec *protocol.Codec) *daemonConnection {
 	}
 }
 
+func mustAppendShellInput(t *testing.T, connection *daemonConnection, channelID uint32, chunk string) string {
+	t.Helper()
+	guarded, ok := connection.appendShellInput(channelID, []byte(chunk))
+	if !ok {
+		t.Fatalf("appendShellInput(%q) rejected the input", chunk)
+	}
+	return guarded
+}
+
 func TestShellInputGuardCatchesCrossFrameCommand(t *testing.T) {
 	connection := newTestDaemonConnection(protocol.NewCodec(4096))
 	// 高危命令 "reboot" 被拆到多帧发送，单帧各自合法，累积后必须被识别。
-	if decision := policy.InspectShellCommand(connection.appendShellInput(5, []byte("reb"))); !decision.Allowed {
+	if decision := policy.InspectShellCommand(mustAppendShellInput(t, connection, 5, "reb")); !decision.Allowed {
 		t.Fatal("partial chunk 'reb' should not be rejected on its own")
 	}
-	guarded := connection.appendShellInput(5, []byte("oot\n"))
+	guarded := mustAppendShellInput(t, connection, 5, "oot\n")
 	if decision := policy.InspectShellCommand(guarded); decision.Allowed {
 		t.Fatalf("accumulated %q should be rejected", guarded)
 	}
 	// channel 关闭时窗口随之清理（生产在 stopShell/removeShell 内联 delete）；此处直接重置验证隔离。
 	delete(connection.shellInput, 5)
-	if decision := policy.InspectShellCommand(connection.appendShellInput(5, []byte("ls\n"))); !decision.Allowed {
+	if decision := policy.InspectShellCommand(mustAppendShellInput(t, connection, 5, "ls\n")); !decision.Allowed {
 		t.Fatal("benign command after clear should be allowed")
 	}
 }
 
-func TestShellInputGuardSlidingWindowBounded(t *testing.T) {
+// TestShellInputGuardDropsCompletedLines 确认已成行的输入不再留在窗口里：
+// 否则每次按键都要重新解析整个历史，判定成本随会话长度二次增长。
+func TestShellInputGuardDropsCompletedLines(t *testing.T) {
 	connection := newTestDaemonConnection(protocol.NewCodec(4096))
-	filler := make([]byte, shellInputGuardLimit)
-	for index := range filler {
-		filler[index] = 'a'
+	mustAppendShellInput(t, connection, 7, "echo hello\n")
+	guarded := mustAppendShellInput(t, connection, 7, "ls")
+	if guarded != "ls" {
+		t.Fatalf("guard window = %q, want only the pending line %q", guarded, "ls")
 	}
-	connection.appendShellInput(7, filler)
-	guarded := connection.appendShellInput(7, []byte("b"))
-	if len(guarded) != shellInputGuardLimit {
-		t.Fatalf("guard window length = %d, want %d", len(guarded), shellInputGuardLimit)
+}
+
+// TestShellInputGuardInspectsEntireChunk 确认护栏检查本帧送达设备的全部输入。
+// 若只截取窗口尾部，「大段填充 + 高危命令」会把命令挤出检查范围而被放行。
+func TestShellInputGuardInspectsEntireChunk(t *testing.T) {
+	connection := newTestDaemonConnection(protocol.NewCodec(4096))
+	padding := strings.Repeat("a", shellInputGuardLimit)
+	guarded := mustAppendShellInput(t, connection, 7, "reboot\n"+padding)
+	if decision := policy.InspectShellCommand(guarded); decision.Allowed {
+		t.Fatal("high-risk command followed by padding should still be rejected")
 	}
+}
+
+// TestShellInputGuardRejectsOversizedInput 超过判定上限时必须拒绝该帧，
+// 而不是缩小检查范围后把未检查的内容转发给设备。
+func TestShellInputGuardRejectsOversizedInput(t *testing.T) {
+	connection := newTestDaemonConnection(protocol.NewCodec(4096))
+	oversized := make([]byte, shellInputInspectLimit+1)
+	for index := range oversized {
+		oversized[index] = 'a'
+	}
+	if _, ok := connection.appendShellInput(7, oversized); ok {
+		t.Fatal("oversized shell input should be rejected")
+	}
+}
+
+// TestShellInputGuardBoundsPendingLine 一直没有换行的超长输入只保留尾部，避免残行无界增长。
+func TestShellInputGuardBoundsPendingLine(t *testing.T) {
+	connection := newTestDaemonConnection(protocol.NewCodec(4096))
+	filler := strings.Repeat("a", shellInputGuardLimit)
+	mustAppendShellInput(t, connection, 7, filler)
+	guarded := mustAppendShellInput(t, connection, 7, "b")
 	if guarded[len(guarded)-1] != 'b' {
-		t.Fatal("sliding window should retain the most recent byte")
+		t.Fatal("guard window should retain the most recent byte")
+	}
+	if retained := connection.shellInput[7].Len(); retained != shellInputGuardLimit {
+		t.Fatalf("pending line length = %d, want %d", retained, shellInputGuardLimit)
 	}
 }
 

@@ -31,3 +31,22 @@ func TestTextLoggerReadableFormat(t *testing.T) {
 		t.Fatalf("time prefix %q not local wall clock: %v", prefix, err)
 	}
 }
+
+// TestTextLoggerEscapesControlCharacters 防止日志注入：属性值里的换行必须被转义，
+// 否则对端可影响的字符串（设备名、透传的错误文本）能伪造出一条以假乱真的日志行。
+func TestTextLoggerEscapesControlCharacters(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewTextLogger(&buf, slog.LevelInfo)
+	logger.Info("device seen", "name", "a\n2026-01-01 00:00:00 INFO forged entry", "path", `C:\tmp\`)
+
+	out := buf.String()
+	if lines := strings.Count(strings.TrimRight(out, "\n"), "\n"); lines != 0 {
+		t.Fatalf("attribute value broke the record into %d extra lines: %q", lines, out)
+	}
+	if !strings.Contains(out, `\n`) {
+		t.Fatalf("newline was not escaped: %q", out)
+	}
+	if !strings.Contains(out, `\\`) {
+		t.Fatalf("backslash was not escaped: %q", out)
+	}
+}

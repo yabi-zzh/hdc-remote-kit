@@ -72,7 +72,7 @@ var defaultPolicy = &Policy{}
 func New(cfg Config) *Policy {
 	extras := make(map[string]struct{}, len(cfg.ExtraDeniedExecutables))
 	for _, item := range cfg.ExtraDeniedExecutables {
-		if normalized := strings.ToLower(strings.TrimSpace(item)); normalized != "" {
+		if normalized := baseExecutable(strings.ToLower(strings.TrimSpace(item))); normalized != "" {
 			extras[normalized] = struct{}{}
 		}
 	}

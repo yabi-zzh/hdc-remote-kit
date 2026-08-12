@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/yabi-zzh/hdc-remote-kit/internal/model"
 )
@@ -27,6 +28,10 @@ type BindingStore struct {
 	backupPath string
 	minPort    int
 	maxPort    int
+
+	// saveMu 串行化 Save：Save 内部是「写临时文件 → 主文件转备份 → 临时文件转正」的多步序列，
+	// 两次 Save 交错会把彼此的中间状态混在一起，可能同时毁掉主文件与备份。
+	saveMu sync.Mutex
 }
 
 // NewBindingStore 在 stateDir 下管理 bindings.json 及其 .bak 备份；minPort/maxPort 用于恢复时校验端口范围。
@@ -59,9 +64,15 @@ func (s *BindingStore) Save(bindings []model.Binding) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o750); err != nil {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
+	directory := filepath.Dir(s.path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create binding state directory: %w", err)
 	}
+	// 固定临时文件名：Save 已由 saveMu 串行化，不会互相踩；
+	// 用唯一名字反而会在进程被强杀时留下永远没人清理的残留文件。
 	temporaryPath := s.path + ".tmp"
 	file, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -87,9 +98,23 @@ func (s *BindingStore) Save(bindings []model.Binding) error {
 	if err := os.Rename(temporaryPath, s.path); err != nil {
 		_ = os.Rename(s.backupPath, s.path)
 		_ = os.Remove(temporaryPath)
+		syncDirectory(directory)
 		return fmt.Errorf("replace binding snapshot: %w", err)
 	}
+	// 文件内容已 Sync，但把它挂上去的两次 rename 只改了目录项。
+	// 不同步父目录的话，掉电后可能主文件与备份同时丢失。
+	syncDirectory(directory)
 	return nil
+}
+
+// syncDirectory 尽力把目录项变更刷盘。部分平台（如 Windows）不支持对目录 Sync，忽略即可。
+func syncDirectory(path string) {
+	handle, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	_ = handle.Sync()
+	_ = handle.Close()
 }
 
 func (s *BindingStore) loadFile(path string) ([]model.Binding, error) {

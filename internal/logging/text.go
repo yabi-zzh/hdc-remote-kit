@@ -123,16 +123,17 @@ func writeAttr(b *strings.Builder, attr slog.Attr) {
 	}
 }
 
+// writeQuoted 用 strconv.Quote 输出需要引用的值。
+// 手写的引号替换只处理双引号，值里的换行会原样落到输出中，
+// 使一条日志被拆成两行、且伪造行与真实日志无法区分（设备名、远端错误文本等都可能被对端影响）。
 func writeQuoted(b *strings.Builder, s string) {
 	if s == "" || strings.IndexFunc(s, needsQuote) >= 0 {
-		b.WriteByte('"')
-		b.WriteString(strings.ReplaceAll(s, `"`, `\"`))
-		b.WriteByte('"')
+		b.WriteString(strconv.Quote(s))
 		return
 	}
 	b.WriteString(s)
 }
 
 func needsQuote(r rune) bool {
-	return r <= ' ' || r == '=' || r == '"'
+	return r <= ' ' || r == '=' || r == '"' || r == '\\' || r == 0x7f
 }

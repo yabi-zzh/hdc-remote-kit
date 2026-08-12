@@ -24,8 +24,10 @@ func TestFileBridgeUploadsSingleUncompressedFile(t *testing.T) {
 	}
 	writer := &syncBuffer{}
 	target := &fakeTargetChannel{responses: [][]byte{{}, []byte("upload ok")}}
+	commands := make(chan string, 4)
 	bridge := NewFileBridge(context.Background(), codec, store, 1024, time.Second,
-		func(context.Context, string) (TargetChannel, error) {
+		func(_ context.Context, command string) (TargetChannel, error) {
+			commands <- command
 			return target, nil
 		}, writer.write)
 	defer bridge.Close()
@@ -60,19 +62,112 @@ func TestFileBridgeUploadsSingleUncompressedFile(t *testing.T) {
 	if err := bridge.Handle(protocol.Frame{ChannelID: 7, CommandFlag: protocol.CommandFileFinish, Payload: []byte{fileFinishAll}}); err != nil {
 		t.Fatalf("Handle(FileFinish) error = %v", err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for writer.len() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	writer.waitNonEmpty(t)
+	var command string
+	select {
+	case command = <-commands:
+	case <-time.After(time.Second):
+		t.Fatal("target channel was never opened")
 	}
-	if writer.len() == 0 {
-		t.Fatal("target upload produced no response")
+	if !strings.HasPrefix(command, "file send ") {
+		t.Fatalf("target command = %q, want a file send command", command)
 	}
-	if target.command != "file send" && target.command != "" {
-		t.Fatalf("unexpected target command marker %q", target.command)
+	// 客户端声明的 OptionalName 必须体现在下发给设备的源文件名上，
+	// 否则目标路径是目录时设备侧会落盘为临时文件名 "payload"。
+	if !strings.Contains(command, "payload.txt") {
+		t.Fatalf("target command = %q, want it to carry the declared file name", command)
+	}
+	if !strings.HasSuffix(strings.Trim(command[strings.LastIndex(command, " ")+1:], `"`), "/data/local/tmp/payload.txt") {
+		t.Fatalf("target command = %q, want it to end with the requested target path", command)
 	}
 	if _, err := os.Stat(tempRoot); err != nil {
 		t.Fatalf("transfer root disappeared unexpectedly: %v", err)
 	}
+}
+
+// TestFileBridgeUploadTimeoutClosesTargetChannel 固化上传路径的超时看门狗。
+// TargetChannel 的读取是阻塞式的，超时必须真的去关闭 channel，
+// 只建一个带 deadline 的 context 并不会让阻塞中的读返回，超时会形同虚设。
+func TestFileBridgeUploadTimeoutClosesTargetChannel(t *testing.T) {
+	codec := protocol.NewCodec(1024 * 1024)
+	store, err := NewTempStore(filepath.Join(t.TempDir(), "transfers"), 1024)
+	if err != nil {
+		t.Fatalf("NewTempStore() error = %v", err)
+	}
+	writer := &syncBuffer{}
+	target := newBlockingTargetChannel()
+	bridge := NewFileBridge(context.Background(), codec, store, 1024, 50*time.Millisecond,
+		func(context.Context, string) (TargetChannel, error) { return target, nil }, writer.write)
+	defer bridge.Close()
+
+	config := protocol.TransferConfig{FileSize: 3, Path: "/data/local/tmp/a.txt", OptionalName: "a.txt"}
+	if err := bridge.Handle(protocol.Frame{ChannelID: 7, CommandFlag: protocol.CommandFileCheck, Payload: protocol.EncodeTransferConfig(config)}); err != nil {
+		t.Fatalf("Handle(FileCheck) error = %v", err)
+	}
+	data, err := protocol.EncodeTransferData(protocol.TransferPayload{
+		Index: 0, Compression: protocol.CompressionNone, CompressedSize: 3, UncompressedSize: 3,
+	}, []byte("abc"))
+	if err != nil {
+		t.Fatalf("EncodeTransferData() error = %v", err)
+	}
+	if err := bridge.Handle(protocol.Frame{ChannelID: 7, CommandFlag: protocol.CommandFileData, Payload: data}); err != nil {
+		t.Fatalf("Handle(FileData) error = %v", err)
+	}
+	if err := bridge.Handle(protocol.Frame{ChannelID: 7, CommandFlag: protocol.CommandFileFinish, Payload: []byte{fileFinishAll}}); err != nil {
+		t.Fatalf("Handle(FileFinish) error = %v", err)
+	}
+	select {
+	case <-target.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload timeout did not close the target channel")
+	}
+}
+
+// TestFileBridgeDownloadTimeoutClosesTargetChannel 固化 recv 路径的超时看门狗。
+func TestFileBridgeDownloadTimeoutClosesTargetChannel(t *testing.T) {
+	codec := protocol.NewCodec(1024 * 1024)
+	store, err := NewTempStore(filepath.Join(t.TempDir(), "transfers"), 1<<20)
+	if err != nil {
+		t.Fatalf("NewTempStore() error = %v", err)
+	}
+	writer := &syncBuffer{}
+	target := newBlockingTargetChannel()
+	bridge := NewFileBridge(context.Background(), codec, store, 1<<20, 50*time.Millisecond,
+		func(context.Context, string) (TargetChannel, error) { return target, nil }, writer.write)
+	defer bridge.Close()
+
+	initFrame := protocol.Frame{ChannelID: 9, CommandFlag: protocol.CommandFileInit, Payload: []byte(`/data/local/tmp/a.txt ./a.txt`)}
+	if err := bridge.Handle(initFrame); err != nil {
+		t.Fatalf("Handle(FileInit) error = %v", err)
+	}
+	select {
+	case <-target.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("download timeout did not close the target channel")
+	}
+}
+
+// blockingTargetChannel 模拟一条永不返回数据的 target channel：
+// ReadPayload 一直阻塞到 Close 被调用，用于验证超时确实会去关闭 channel。
+type blockingTargetChannel struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newBlockingTargetChannel() *blockingTargetChannel {
+	return &blockingTargetChannel{closed: make(chan struct{})}
+}
+
+func (t *blockingTargetChannel) ReadPayload() ([]byte, error) {
+	<-t.closed
+	return nil, net.ErrClosed
+}
+
+func (t *blockingTargetChannel) WritePayload([]byte) error { return nil }
+
+func (t *blockingTargetChannel) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
 }
 
 func TestFileBridgeRejectsUnsupportedTransferModes(t *testing.T) {
@@ -152,6 +247,20 @@ func (b *syncBuffer) len() int {
 	return b.buf.Len()
 }
 
+// waitNonEmpty 等待后台 goroutine 至少写出一帧。文件桥的 target 传输与 recv 回放
+// 都在独立 goroutine 上执行，测试不能在 Handle 返回后立刻读缓冲。
+func (b *syncBuffer) waitNonEmpty(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.len() > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for a frame to be written")
+}
+
 func TestFileBridgeDownloadsSingleFile(t *testing.T) {
 	codec := protocol.NewCodec(1024 * 1024)
 	store, err := NewTempStore(filepath.Join(t.TempDir(), "transfers"), 1<<20)
@@ -177,10 +286,7 @@ func TestFileBridgeDownloadsSingleFile(t *testing.T) {
 		t.Fatalf("Handle(FileInit) error = %v", err)
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for writer.len() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	writer.waitNonEmpty(t)
 	check := decodeWrittenFrame(t, codec, writer.snapshot())
 	if check.CommandFlag != protocol.CommandFileCheck {
 		t.Fatalf("expected CMD_FILE_CHECK, got %d", check.CommandFlag)
@@ -197,6 +303,7 @@ func TestFileBridgeDownloadsSingleFile(t *testing.T) {
 	if err := bridge.Handle(protocol.Frame{ChannelID: 9, CommandFlag: protocol.CommandFileBegin}); err != nil {
 		t.Fatalf("Handle(FileBegin) error = %v", err)
 	}
+	writer.waitNonEmpty(t)
 	data := decodeWrittenFrame(t, codec, writer.snapshot())
 	if data.CommandFlag != protocol.CommandFileData {
 		t.Fatalf("expected CMD_FILE_DATA, got %d", data.CommandFlag)

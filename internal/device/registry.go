@@ -26,29 +26,49 @@ type Scanner interface {
 // Registry 维护设备事实的后台快照：由 Run 的 poll ticker 独占刷新，读方只取快照、绝不触发扫描。
 // 扫描失败时保留上次成功快照并计 stale 时间，连续超过 staleAfter 才把设备降级为 UNKNOWN，避免瞬时抖动误判离线。
 type Registry struct {
-	scanner      Scanner
-	pollInterval time.Duration
-	staleAfter   time.Duration
-	logger       *slog.Logger
-	now          func() time.Time
+	scanner       Scanner
+	pollInterval  time.Duration
+	staleAfter    time.Duration
+	retainOffline time.Duration
+	logger        *slog.Logger
+	now           func() time.Time
 
-	mu          sync.RWMutex
-	devices     map[string]model.Device
-	lastSuccess time.Time
-	ready       bool
+	runDone     chan struct{}
+	runDoneOnce sync.Once
+
+	mu      sync.RWMutex
+	devices map[string]model.Device
+	// offlineSince 记录设备最近一次不在扫描结果中的时刻，用于淘汰长期离线设备。
+	// 不能复用 Device.UpdatedAt：扫描失败时 markStale 会刷新它，
+	// 一次短暂的扫描中断就会把所有设备的淘汰计时清零，淘汰将永远不会发生。
+	offlineSince map[string]time.Time
+	lastSuccess  time.Time
+	ready        bool
 }
+
+// offlineRetentionFactor 决定离线设备的保留时长（staleAfter 的倍数）：
+// 保留一段时间是为了让刚拔下的设备仍能在快照里被看到，超过则淘汰。
+const offlineRetentionFactor = 60
 
 // NewRegistry 构造设备注册表；pollInterval 为扫描周期，staleAfter 为判定快照过期的阈值。
 func NewRegistry(scanner Scanner, pollInterval, staleAfter time.Duration, logger *slog.Logger) *Registry {
 	return &Registry{
 		scanner: scanner, pollInterval: pollInterval, staleAfter: staleAfter,
-		logger: logger, now: time.Now, devices: make(map[string]model.Device),
+		retainOffline: staleAfter * offlineRetentionFactor,
+		logger:        logger, now: time.Now, devices: make(map[string]model.Device),
+		offlineSince: make(map[string]time.Time),
+		runDone:      make(chan struct{}),
 	}
 }
 
 // Run 独占设备轮询循环：启动即先扫描一次，之后按 pollInterval 周期刷新，直到 ctx 取消。
-// 调用方只读取快照，绝不自行触发 HDC 扫描。
+// 调用方只读取快照，绝不自行触发 HDC 扫描。退出时关闭 Done() 返回的 channel。
 func (r *Registry) Run(ctx context.Context) {
+	// Once 保护：重复调用 Run 时不会 panic 于重复 close。
+	defer r.runDoneOnce.Do(func() { close(r.runDone) })
+	if ctx.Err() != nil {
+		return
+	}
 	r.refresh(ctx)
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
@@ -61,6 +81,9 @@ func (r *Registry) Run(ctx context.Context) {
 		}
 	}
 }
+
+// Done 在轮询循环退出后关闭，供装配层有序收尾。
+func (r *Registry) Done() <-chan struct{} { return r.runDone }
 
 // Devices 返回按 ID 排序的设备快照；首次成功扫描前返回 ErrRegistryNotReady。
 func (r *Registry) Devices() ([]model.Device, error) {
@@ -109,6 +132,11 @@ func (r *Registry) refresh(ctx context.Context) {
 	now := r.now().UTC()
 	if err != nil {
 		r.markStale(now)
+		// 停机时正在途中的扫描必然失败，这属于正常收尾，不该每次退出都刷一条告警。
+		if ctx.Err() != nil {
+			r.logger.Debug("HDC device scan cancelled during shutdown", "error", err)
+			return
+		}
 		r.logger.Warn("HDC device scan failed", "error", err)
 		return
 	}
@@ -123,12 +151,32 @@ func (r *Registry) refresh(ctx context.Context) {
 	}
 
 	r.mu.Lock()
+	for deviceID := range r.offlineSince {
+		if _, exists := r.devices[deviceID]; !exists {
+			delete(r.offlineSince, deviceID)
+		}
+	}
 	for deviceID, previous := range r.devices {
 		if _, exists := next[deviceID]; exists {
+			delete(r.offlineSince, deviceID)
 			continue
 		}
-		previous.Status = model.TargetOffline
-		previous.UpdatedAt = now
+		since, tracked := r.offlineSince[deviceID]
+		if !tracked {
+			since = now
+			r.offlineSince[deviceID] = since
+		}
+		// 持续离线足够久的设备直接淘汰，不再进入新快照。
+		// 只标记不删除的话这张表只增不减，长期运行的机器（换过多台设备、
+		// 或 connectKey 变过形）会让每轮扫描、排序与对账的开销一路增长。
+		if now.Sub(since) > r.retainOffline {
+			delete(r.offlineSince, deviceID)
+			continue
+		}
+		if previous.Status != model.TargetOffline {
+			previous.Status = model.TargetOffline
+			previous.UpdatedAt = now
+		}
 		next[deviceID] = previous
 	}
 	changed := !sameDeviceSnapshot(r.devices, next)

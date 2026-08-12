@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yabi-zzh/hdc-remote-kit/internal/config"
@@ -43,6 +44,7 @@ type BindingStore interface {
 // Gateway 是公网 daemon 入口契约，由 gateway.Gateway 实现；Manager 通过 Grant 驱动其启停 listener。
 type Gateway interface {
 	Bind(ctx context.Context, grant model.Grant) error
+	UpdateGrant(grant model.Grant) error
 	Unbind(bindingID string) error
 	Close() error
 }
@@ -61,7 +63,21 @@ type Manager struct {
 	now      func() time.Time
 	logger   *slog.Logger
 
+	// runDone 在 Run 退出时关闭；Close 等待它，避免对账循环与收尾逻辑并发写状态。
+	// 若 Run 从未启动，runStarted 保持 false，Close 直接跳过等待。
+	runDone    chan struct{}
+	runStarted atomic.Bool
+
+	// saveMu 串行化快照持久化，保证「取内存状态 → 落盘」整体有序，
+	// 避免后写入的调用把先取到的旧状态盖回磁盘。
+	saveMu sync.Mutex
+
+	// closeMu 串行化 Close，closeErr 由它保护，供重复调用返回同一结果。
+	closeMu  sync.Mutex
+	closeErr error
+
 	mu                 sync.Mutex
+	closed             bool
 	gateway            Gateway
 	bindingsByDevice   map[string]model.Binding
 	bindingsByID       map[string]model.Binding
@@ -83,6 +99,7 @@ func NewManager(registry DeviceRegistry, bindingStore BindingStore, cfg config.C
 	manager := &Manager{
 		registry: registry, store: bindingStore, cfg: cfg, logger: logger,
 		ports: newPortPool(cfg.ProxyBindHost, cfg.ProxyPortMin, cfg.ProxyPortMax), now: time.Now,
+		runDone:          make(chan struct{}),
 		bindingsByDevice: make(map[string]model.Binding), bindingsByID: make(map[string]model.Binding),
 		leasesByDevice: make(map[string]model.Lease), leasesByID: make(map[string]model.Lease),
 		inflightByDevice: make(map[string]struct{}), lastRejectedReason: make(map[string]string),
@@ -108,7 +125,10 @@ func (m *Manager) SetGateway(gateway Gateway) {
 
 // Run 启动后台对账循环（每秒一次）：先 reconcile 收敛 Lease/Binding（保险 TTL 到期、离线冻结），
 // 再 AutoExpose 自动转发在线 USB 设备并刷新其保险 TTL，直到 ctx 取消。
+// 退出时关闭 done，Close 会等待它，确保对账循环不会与收尾逻辑并发改状态。
 func (m *Manager) Run(ctx context.Context) {
+	m.runStarted.Store(true)
+	defer close(m.runDone)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -116,10 +136,21 @@ func (m *Manager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Close 已开始就不再对账：此时 gateway 可能已关闭，
+			// 继续跑只会产生无谓的 Bind 失败告警，还可能在最终快照之后再改状态。
+			if m.isClosed() {
+				return
+			}
 			m.reconcile(ctx)
 			m.AutoExpose(ctx)
 		}
 	}
+}
+
+func (m *Manager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
 }
 
 // Acquire 开启远程访问：校验入参 → 确认设备为在线 USB → 恢复或分配稳定 Binding → 创建 Lease/Grant → 启动 listener，
@@ -143,12 +174,26 @@ func (m *Manager) Acquire(ctx context.Context, request model.AcquireRequest) (mo
 	if lease, exists := m.leasesByDevice[device.ID]; exists && lease.Status == model.LeaseActive {
 		if lease.OwnerID == normalized.OwnerID {
 			// 同 owner 幂等：刷新保险 TTL（keepalive），使自动转发的租约在设备在线期间持续有效。
-			lease.ExpiresAt = m.now().UTC().Add(normalized.TTL)
-			lease.UpdatedAt = m.now().UTC()
+			now := m.now().UTC()
+			lease.ExpiresAt = now.Add(normalized.TTL)
+			lease.UpdatedAt = now
+			lease.AllowedSourceCIDRs = normalized.AllowedSourceCIDRs
+			lease.MaxConnections = normalized.MaxConnections
+			lease.PolicyProfile = normalized.PolicyProfile
 			m.leasesByID[lease.ID] = lease
 			m.leasesByDevice[device.ID] = lease
+			binding, hasBinding := m.bindingsByDevice[device.ID]
+			gateway := m.gateway
 			view := m.buildViewLocked(device, "")
 			m.mu.Unlock()
+			// listener 持有的是 Grant 快照，续期必须同步过去，
+			// 否则设备持续在线满 TTL 后 admit 会拒绝所有新连接且不再恢复。
+			if gateway != nil && hasBinding {
+				if err := gateway.UpdateGrant(buildGrant(lease, binding, prefixes)); err != nil {
+					m.logger.Warn("remote access lease renewal failed",
+						"serial", model.DeviceSerial(device.ID), "error", err)
+				}
+			}
 			return view, nil
 		}
 		view := m.buildViewLocked(device, "")
@@ -181,16 +226,16 @@ func (m *Manager) Acquire(ctx context.Context, request model.AcquireRequest) (mo
 		MaxConnections: normalized.MaxConnections, PolicyProfile: normalized.PolicyProfile,
 		Status: model.LeaseActive, ExpiresAt: now.Add(normalized.TTL), CreatedAt: now, UpdatedAt: now,
 	}
-	grant := model.Grant{
-		LeaseID: lease.ID, Binding: binding, DeviceID: device.ID, OwnerID: lease.OwnerID,
-		AllowedSourcePrefixes: prefixes, MaxConnections: lease.MaxConnections,
-		ExpiresAt: lease.ExpiresAt, PolicyProfile: lease.PolicyProfile,
-	}
-	if err := gateway.Bind(ctx, grant); err != nil {
+	if err := gateway.Bind(ctx, buildGrant(lease, binding, prefixes)); err != nil {
 		return failedView(device.ID, "Remote access port is not available."), err
 	}
 
 	m.mu.Lock()
+	// 重新取一次 binding：Bind 期间未持锁，reconcile 可能已更新同一条记录，
+	// 直接写回此前的副本会覆盖掉它的改动。
+	if current, ok := m.bindingsByDevice[device.ID]; ok {
+		binding = current
+	}
 	binding.Status = model.BindingListening
 	binding.UpdatedAt = m.now().UTC()
 	m.bindingsByDevice[device.ID] = binding
@@ -200,6 +245,15 @@ func (m *Manager) Acquire(ctx context.Context, request model.AcquireRequest) (mo
 	view := m.buildViewLocked(device, "")
 	m.mu.Unlock()
 	return view, nil
+}
+
+// buildGrant 由 Lease 与 Binding 投影出 gateway 的准入快照。
+func buildGrant(lease model.Lease, binding model.Binding, prefixes []netip.Prefix) model.Grant {
+	return model.Grant{
+		LeaseID: lease.ID, Binding: binding, DeviceID: lease.DeviceID, OwnerID: lease.OwnerID,
+		AllowedSourcePrefixes: prefixes, MaxConnections: lease.MaxConnections,
+		ExpiresAt: lease.ExpiresAt, PolicyProfile: lease.PolicyProfile,
+	}
 }
 
 // AutoExpose 为当前所有在线 USB 设备开启（或续期）转发：新设备首次暴露时打印 hdc tconn 连接命令。
@@ -286,8 +340,25 @@ func (m *Manager) ConnectionRejected(leaseID, reason string) {
 	}
 }
 
-// Close 关闭编排器：解绑所有活跃 listener、关闭 gateway 并持久化最终 Binding 快照。
+// Close 关闭编排器：等待对账循环退出，然后解绑所有活跃 listener、关闭 gateway 并持久化最终 Binding 快照。
+// 必须先于收尾等待对账循环退出，否则一次进行中的 tick 会在 gateway 关闭后继续 Bind、
+// 并在最终快照写完之后再改状态。调用方需先取消传给 Run 的 ctx。
 func (m *Manager) Close() error {
+	// closeMu 让并发的第二个调用者等待首个调用者收尾完毕再返回，
+	// 只用 closed 标志会让它在 listener 还没解绑、快照还没落盘时就得到成功。
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return m.closeErr
+	}
+	m.closed = true
+	m.mu.Unlock()
+	if m.runStarted.Load() {
+		<-m.runDone
+	}
+
 	m.mu.Lock()
 	gateway := m.gateway
 	bindingIDs := make([]string, 0, len(m.leasesByDevice))
@@ -312,7 +383,8 @@ func (m *Manager) Close() error {
 	if err := m.saveBindings(); err != nil {
 		closeErrors = append(closeErrors, err)
 	}
-	return errors.Join(closeErrors...)
+	m.closeErr = errors.Join(closeErrors...)
+	return m.closeErr
 }
 
 func (m *Manager) createBinding(deviceID string) (model.Binding, error) {
@@ -342,6 +414,12 @@ func (m *Manager) createBinding(deviceID string) (model.Binding, error) {
 
 // releaseLease 是释放的统一收敛点：Lease 转 RELEASING → Unbind listener → 删除 Lease 与相关计时 →
 // 依设备是否在线把 Binding 置为 RESERVED/FROZEN → 持久化。Unbind 失败则 Lease 置 FAILED。
+//
+// 与 Acquire 共用 inflightByDevice 互斥：Unbind 期间不持锁，
+// 而 Acquire 的冲突检查只拦 ACTIVE 租约、放行 RELEASING，
+// 两者若能并发，本函数的 Unbind 可能后于新租约的 Bind 执行，把刚建好的 listener 拆掉，
+// 留下一个有租约却无 listener、直到 TTL 到期都无法自愈的设备。
+// 设备正忙时返回 ErrLeaseConflict，由下一个 reconcile tick 重试。
 func (m *Manager) releaseLease(leaseID string, finalStatus model.LeaseStatus) error {
 	m.mu.Lock()
 	lease, ok := m.leasesByID[leaseID]
@@ -349,6 +427,11 @@ func (m *Manager) releaseLease(leaseID string, finalStatus model.LeaseStatus) er
 		m.mu.Unlock()
 		return nil
 	}
+	if _, busy := m.inflightByDevice[lease.DeviceID]; busy {
+		m.mu.Unlock()
+		return ErrLeaseConflict
+	}
+	m.inflightByDevice[lease.DeviceID] = struct{}{}
 	lease.Status = model.LeaseReleasing
 	lease.UpdatedAt = m.now().UTC()
 	m.leasesByID[leaseID] = lease
@@ -356,6 +439,7 @@ func (m *Manager) releaseLease(leaseID string, finalStatus model.LeaseStatus) er
 	binding := m.bindingsByID[lease.BindingID]
 	gateway := m.gateway
 	m.mu.Unlock()
+	defer m.clearInflight(lease.DeviceID)
 
 	if gateway != nil {
 		if err := gateway.Unbind(binding.ID); err != nil {
@@ -372,7 +456,14 @@ func (m *Manager) releaseLease(leaseID string, finalStatus model.LeaseStatus) er
 	device, online := m.registry.Find(lease.DeviceID)
 	m.mu.Lock()
 	delete(m.leasesByID, leaseID)
-	delete(m.leasesByDevice, lease.DeviceID)
+	if current, exists := m.leasesByDevice[lease.DeviceID]; exists && current.ID == leaseID {
+		delete(m.leasesByDevice, lease.DeviceID)
+	}
+	// 重新取一次 binding：Unbind 与 registry.Find 期间未持锁，
+	// reconcileBindings 可能已更新同一条记录，写回旧副本会把它的改动盖掉。
+	if current, exists := m.bindingsByID[binding.ID]; exists && binding.ID != "" {
+		binding = current
+	}
 	if binding.ID != "" {
 		if online && device.Status == model.TargetOnline && device.Transport == model.TransportUSB {
 			binding.Status = model.BindingReserved
@@ -555,6 +646,10 @@ func (m *Manager) clearInflight(deviceID string) {
 }
 
 func (m *Manager) saveBindings() error {
+	// 整个「取快照 → 落盘」必须串行：并发调用下，后取到较新状态的一方可能先落盘，
+	// 随后较旧的一方再覆盖回去，磁盘上留下的就是过期快照。
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	m.mu.Lock()
 	bindings := make([]model.Binding, 0, len(m.bindingsByDevice))
 	for _, binding := range m.bindingsByDevice {
