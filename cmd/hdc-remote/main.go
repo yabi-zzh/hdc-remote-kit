@@ -15,9 +15,11 @@ import (
 	"github.com/yabi-zzh/hdc-remote-kit/internal/device"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/gateway"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/hdc"
+	"github.com/yabi-zzh/hdc-remote-kit/internal/hostauth"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/logging"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/remote"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/store"
+	"github.com/yabi-zzh/hdc-remote-kit/internal/web"
 )
 
 // version 为构建版本号，发布时通过 -ldflags "-X main.version=..." 注入，默认 dev。
@@ -25,7 +27,7 @@ var version = "dev"
 
 // main 完成进程装配与生命周期管理：加载配置 → 构建 host/registry/store/manager/audit/gateway 并互相接线 →
 // 后台启动设备轮询与自动转发对账 → 等待退出信号 → 有序关闭（manager、audit）。
-// 服务无控制面：启动后自动为每台在线 USB 设备开启转发，并在日志打印对应的 hdc tconn 连接命令。
+// 启动后自动为每台在线 USB 设备开启转发；默认验签后直连，`confirm` 时须本机确认台放行（日志只打印指纹）。
 func main() {
 	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	logLevelFlag := flag.String("log-level", "", "日志级别：debug|info|warn|error（覆盖 HDC_REMOTE_LOG_LEVEL）")
@@ -68,8 +70,18 @@ func main() {
 		logger.Error("failed to initialize audit sink", "error", err)
 		os.Exit(1)
 	}
-	gatewayServer := gateway.New(cfg, manager, manager, host, auditSink, logger)
+	hosts, err := hostauth.NewRegistry(cfg.StateDir, cfg.AuthConfirmTimeout, logger)
+	if err != nil {
+		logger.Error("failed to restore known hosts", "error", err)
+		os.Exit(1)
+	}
+	gatewayServer := gateway.New(cfg, manager, manager, host, hosts, auditSink, logger)
 	manager.SetGateway(gatewayServer)
+	console := web.New(cfg.WebAddr, hosts, manager, gatewayServer, cfg.HostAuth, logger)
+	if err := console.Start(); err != nil {
+		logger.Error("failed to start auth console", "error", err)
+		os.Exit(1)
+	}
 
 	runCtx, stopRuntime := context.WithCancel(context.Background())
 	defer stopRuntime()
@@ -81,7 +93,12 @@ func main() {
 		"proxy_ports", fmt.Sprintf("%d-%d", cfg.ProxyPortMin, cfg.ProxyPortMax),
 		"allowed_source_cidrs", strings.Join(cfg.AllowedSourceCIDRs, ","),
 		"max_connections", cfg.MaxConnections,
+		"host_auth", cfg.HostAuth,
 		"profile", cfg.PolicyProfile)
+	if cfg.HostAuth == config.HostAuthOff {
+		logger.Warn("host auth is off; any hdc client that can reach a proxy port can debug after the public-key handshake",
+			"hint", "set HDC_REMOTE_HOST_AUTH=confirm to require the local console")
+	}
 	if unrestricted := config.UnrestrictedSourceCIDRs(cfg.AllowedSourceCIDRs); len(unrestricted) > 0 {
 		logger.Warn("allowed_source_cidrs permit every reachable network; any host that can reach this port can debug the attached devices",
 			"cidrs", strings.Join(unrestricted, ","),
@@ -108,6 +125,7 @@ func main() {
 	}()
 
 	stopRuntime()
+	_ = console.Close(context.Background())
 	// manager.Close 内部会等待对账循环退出，这里不需要靠 sleep 猜时间。
 	if err := manager.Close(); err != nil {
 		logger.Warn("HDC remote service cleanup failed", "error", err)

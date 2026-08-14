@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+## [0.3.0]
+
+### 新增
+
+- 远程 `hdc tconn` 改为官方多轮公钥握手。默认 `HDC_REMOTE_HOST_AUTH=off`：来源白名单内完成验签后进入命令转发，不写 `known_hosts`。`confirm`（或 `on`）时未知电脑 `tconn` 仍打印 `Connect OK`（官方客户端写死），`list targets` 为 Unauthorized；本机在 http://127.0.0.1:18080 点「始终允许」或「仅当次」后才进入命令转发。「始终允许」写入 `STATE_DIR/known_hosts.json`，「仅当次」不落盘。日志打印 `auth pending` 指纹供对照，没有终端 allow/deny。
+- 远程客户端须 `hdc >= Ver: 3.0.0b`（`hdc -v`）；更低版本在 `AUTH_NONE` 即被拒（`confirm` / `off` 都拒），确认台只提示升级，不出现放行按钮。版本按官方 `Ver: x.y.z[letter]` 比较。
+- 新增 `HDC_REMOTE_WEB_ADDR`（默认 `127.0.0.1:18080`，空字符串关闭确认台；非回环地址启动失败）、`HDC_REMOTE_AUTH_CONFIRM_TIMEOUT`（`confirm` 下等待放行，默认 `90s`）与 `HDC_REMOTE_HOST_AUTH`（默认 `off`；`confirm` / `on` 打开人工授权）。确认台可看待确认、版本过低提示、已验签会话（可踢出，不撤白名单）与白名单（可撤销，不拆已建立连接）。
+- 握手在已解析出公钥后，审计写入 `fingerprint`（不含 PEM）。待确认连接仍占用该设备的 `MAX_CONNECTIONS`（默认 2）。
+
+### 变更
+
+- 相对 0.2.0：握手改为官方公钥；低于 `Ver: 3.0.0b` 的客户端无法接入。默认 `off` 时来源 CIDR 内验签后直连；`confirm` 时未知公钥须本机确认台放行。
+
+### 安全
+
+- 远程调试身份绑对端 hdc 公钥（`~/.harmony/hdckey`）。默认 `HDC_REMOTE_HOST_AUTH=off` 时关闭人工授权，来源白名单内能完成官方握手的客户端可直接调试。
+- 确认台强制只绑回环；API 拒绝非回环 Host/Origin，并要求启动时生成的随机 token（防 DNS rebinding / CSRF）。
+
 ## [0.2.0]
 
 ### 新增

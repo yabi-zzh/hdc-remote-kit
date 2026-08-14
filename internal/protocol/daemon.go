@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -16,9 +17,17 @@ const (
 	DaemonHeaderBytes          = 11   // 固定帧头长度
 	DaemonProtocolVersion      = 0x01 // 帧头版本字节
 	DaemonVCode                = 0x09 // protect 段校验码，解码时严格比对
-	HandshakeAuthNone          = 0    // 握手请求：无鉴权（tconn 直连场景）
-	HandshakeAuthOK            = 4    // 握手应答：鉴权通过
+	HandshakeAuthNone          = 0    // 握手第一轮：客户端声明能力，尚未提交公钥
+	HandshakeAuthSignature     = 2    // 握手：签名挑战 / 应答
+	HandshakeAuthPublicKey     = 3    // 握手：索要或提交主机公钥
+	HandshakeAuthOK            = 4    // 握手应答：鉴权通过（或带 UNAUTH 状态的通知）
+	HandshakeAuthFail          = 5
 	HandshakeFallbackVersion   = "Ver: 3.2.0c"
+	HandshakeMinAuthVersion    = "Ver: 3.0.0b"
+	DaemonAuthSuccess          = "SUCCESS"
+	DaemonAuthUnauthorized     = "DAEMON_UNAUTH"
+	HandshakeTLVAuthType       = "authtype"
+	HandshakeAuthTypeSHA512    = "1"
 	ChannelCloseRemainingCount = 1 // ChannelClose 帧的初始剩余计数（两段关闭握手用）
 )
 
@@ -37,7 +46,7 @@ type Frame struct {
 // SessionHandshake 是 HDC 会话握手帧的字段集（protobuf 风格编码）。
 type SessionHandshake struct {
 	Banner     string // 固定 "OHOS HDC"
-	AuthType   uint8  // HandshakeAuthNone / HandshakeAuthOK
+	AuthType   uint8  // HandshakeAuthNone / PublicKey / Signature / OK
 	SessionID  uint32
 	ConnectKey string
 	Buffer     string // 认证成功时携带 devname 等 TLV
@@ -219,20 +228,118 @@ func (c *Codec) EncodeSessionHandshake(channelID uint32, handshake SessionHandsh
 
 // EncodeHandshakeOK 构造 daemon 侧握手成功应答：banner=OHOS HDC、authType=OK，buffer 内含设备名等认证成功 TLV。
 func (c *Codec) EncodeHandshakeOK(request Frame, requestHandshake SessionHandshake, deviceName string) []byte {
-	if strings.TrimSpace(deviceName) == "" {
-		deviceName = "hdc-remote"
+	return c.EncodeHandshakeReply(request.ChannelID, handshakeVersion(requestHandshake.Version), HandshakeAuthOK, buildAuthStatusTLV(deviceName, "", DaemonAuthSuccess))
+}
+
+// EncodeHandshakePublicKey 回复 AUTH_PUBLICKEY：若对端支持 SHA-512 则在 buffer 声明 authtype=1。
+func (c *Codec) EncodeHandshakePublicKey(channelID uint32, version string, supportSHA512 bool) []byte {
+	buffer := ""
+	if supportSHA512 {
+		buffer = AppendHandshakeTLV("", HandshakeTLVAuthType, HandshakeAuthTypeSHA512)
 	}
-	version := requestHandshake.Version
-	if version == "" {
-		version = HandshakeFallbackVersion
-	}
+	return c.EncodeHandshakeReply(channelID, handshakeVersion(version), HandshakeAuthPublicKey, buffer)
+}
+
+// EncodeHandshakeSignatureChallenge 发送待签名的随机 token。
+func (c *Codec) EncodeHandshakeSignatureChallenge(channelID uint32, version, token string) []byte {
+	return c.EncodeHandshakeReply(channelID, handshakeVersion(version), HandshakeAuthSignature, token)
+}
+
+// EncodeHandshakeUnauthorized 回 AUTH_OK + DAEMON_UNAUTH：tconn 打印 Connect OK，list targets 为 Unauthorized。
+// 用于待确认（会话继续等放行）以及拒绝 / 版本过低（调用方随后拆连接）。
+func (c *Codec) EncodeHandshakeUnauthorized(channelID uint32, version, deviceName, message string) []byte {
+	reply := c.EncodeHandshakeReply(channelID, handshakeVersion(version), HandshakeAuthOK, buildAuthStatusTLV(deviceName, message, DaemonAuthUnauthorized))
+	return append(reply, c.EncodeChannelClose(channelID)...)
+}
+
+// EncodeHandshakeReply 编码一帧握手应答，不附带 ChannelClose。
+func (c *Codec) EncodeHandshakeReply(channelID uint32, version string, authType uint8, buffer string) []byte {
 	response := SessionHandshake{
 		Banner:   "OHOS HDC",
-		AuthType: HandshakeAuthOK,
-		Buffer:   buildAuthSuccessTLV(deviceName),
-		Version:  version,
+		AuthType: authType,
+		Buffer:   buffer,
+		Version:  handshakeVersion(version),
 	}
-	return c.EncodeFrame(request.ChannelID, CommandKernelHandshake, encodeSessionHandshake(response))
+	return c.EncodeFrame(channelID, CommandKernelHandshake, encodeSessionHandshake(response))
+}
+
+func handshakeVersion(version string) string {
+	if strings.TrimSpace(version) == "" {
+		return HandshakeFallbackVersion
+	}
+	return version
+}
+
+type hdcVersion struct {
+	major, minor, patch int
+	letter              byte
+}
+
+// ClientVersionTooOld 判定官方 hdc 版本低于可走公钥握手的下限。
+// 按 Ver: <major>.<minor>.<patch><letter> 比较；-buildhash 丢掉。空版本或解不出的版本不拒。
+func ClientVersionTooOld(version string) bool {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return false
+	}
+	got, ok := parseHdcVersion(version)
+	if !ok {
+		return false
+	}
+	min, ok := parseHdcVersion(HandshakeMinAuthVersion)
+	if !ok {
+		return false
+	}
+	return compareHdcVersion(got, min) < 0
+}
+
+func parseHdcVersion(raw string) (hdcVersion, bool) {
+	value := strings.TrimSpace(raw)
+	if after, ok := strings.CutPrefix(value, "Ver:"); ok {
+		value = strings.TrimSpace(after)
+	} else if after, ok := strings.CutPrefix(value, "ver:"); ok {
+		value = strings.TrimSpace(after)
+	}
+	if index := strings.IndexByte(value, '-'); index >= 0 {
+		value = value[:index]
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return hdcVersion{}, false
+	}
+	letter := byte(0)
+	last := value[len(value)-1]
+	if last >= 'A' && last <= 'Z' {
+		last += 'a' - 'A'
+	}
+	if last >= 'a' && last <= 'z' {
+		letter = last
+		value = value[:len(value)-1]
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return hdcVersion{}, false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errMajor != nil || errMinor != nil || errPatch != nil || major < 0 || minor < 0 || patch < 0 {
+		return hdcVersion{}, false
+	}
+	return hdcVersion{major: major, minor: minor, patch: patch, letter: letter}, true
+}
+
+func compareHdcVersion(left, right hdcVersion) int {
+	if left.major != right.major {
+		return left.major - right.major
+	}
+	if left.minor != right.minor {
+		return left.minor - right.minor
+	}
+	if left.patch != right.patch {
+		return left.patch - right.patch
+	}
+	return int(left.letter) - int(right.letter)
 }
 
 // shellControlReplacer 复用同一个 Replacer 实例：strings.NewReplacer 每次调用都会重建匹配结构。
@@ -370,18 +477,51 @@ func encodeSessionHandshake(handshake SessionHandshake) []byte {
 const authTLVFieldWidth = 16
 
 func buildAuthSuccessTLV(deviceName string) string {
-	var builder strings.Builder
-	appendTLV := func(tag, value string) {
-		if len(tag) > authTLVFieldWidth {
-			tag = tag[:authTLVFieldWidth]
-		}
-		builder.WriteString(fmt.Sprintf("%-*s%-*d%s", authTLVFieldWidth, tag, authTLVFieldWidth, len(value), value))
+	return buildAuthStatusTLV(deviceName, "", DaemonAuthSuccess)
+}
+
+func buildAuthStatusTLV(deviceName, message, authStatus string) string {
+	buffer := AppendHandshakeTLV("", "emgmsg", message)
+	buffer = AppendHandshakeTLV(buffer, "devname", deviceName)
+	buffer = AppendHandshakeTLV(buffer, "daemonauthstatus", authStatus)
+	return AppendHandshakeTLV(buffer, "1200", "enable")
+}
+
+// AppendHandshakeTLV 按官方 16+16 定宽 TLV 追加一项。
+func AppendHandshakeTLV(buffer, tag, value string) string {
+	if len(tag) > authTLVFieldWidth {
+		tag = tag[:authTLVFieldWidth]
 	}
-	appendTLV("emgmsg", "")
-	appendTLV("devname", deviceName)
-	appendTLV("daemonauthstatus", "SUCCESS")
-	appendTLV("1200", "enable")
-	return builder.String()
+	return buffer + fmt.Sprintf("%-*s%-*d%s", authTLVFieldWidth, tag, authTLVFieldWidth, len(value), value)
+}
+
+// ParseHandshakeTLV 解析官方定宽握手 TLV。畸形输入返回错误，供能力协商 fail-open 到旧算法。
+func ParseHandshakeTLV(buffer string) (map[string]string, error) {
+	fields := make(map[string]string)
+	remaining := buffer
+	for remaining != "" {
+		if len(remaining) < authTLVFieldWidth*2 {
+			return nil, fmt.Errorf("HDC handshake TLV is truncated")
+		}
+		tag := strings.TrimSpace(remaining[:authTLVFieldWidth])
+		lengthText := strings.TrimSpace(remaining[authTLVFieldWidth : authTLVFieldWidth*2])
+		length := 0
+		for _, r := range lengthText {
+			if r < '0' || r > '9' {
+				return nil, fmt.Errorf("HDC handshake TLV length is invalid")
+			}
+			length = length*10 + int(r-'0')
+		}
+		start := authTLVFieldWidth * 2
+		if length < 0 || start+length > len(remaining) {
+			return nil, fmt.Errorf("HDC handshake TLV value is truncated")
+		}
+		if tag != "" {
+			fields[tag] = remaining[start : start+length]
+		}
+		remaining = remaining[start+length:]
+	}
+	return fields, nil
 }
 
 func extractTLVValue(payload []byte, expectedTag uint32) []byte {

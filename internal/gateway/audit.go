@@ -24,6 +24,7 @@ func (c *daemonConnection) audit(frame protocol.Frame, decision model.AuditDecis
 		DeviceID:          c.binding.DeviceID,
 		OwnerID:           c.ownerID,
 		SourceIP:          c.sourceIP,
+		Fingerprint:       c.authIdentity.Fingerprint,
 		CommandFlag:       uint64(frame.CommandFlag),
 		CommandName:       frame.CommandName,
 		NormalizedCommand: auditNormalized(frame),

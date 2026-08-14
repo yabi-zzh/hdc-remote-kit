@@ -4,10 +4,11 @@ hdc-remote-kit 把服务器上的 USB 设备通过网络暴露为可远程调试
 
 ## 信任模型与边界
 
-- **主信任边界是网络准入**：来源 CIDR 白名单（`HDC_REMOTE_ALLOWED_SOURCE_CIDRS`，默认 loopback + RFC1918 私网）+ 单设备并发上限 + 租约保险 TTL。只应对可信来源开放。
+- **远程调试身份是对端 hdc 公钥**：默认 `HDC_REMOTE_HOST_AUTH=off`，来源白名单内能完成官方握手的客户端可直接调试。`confirm`（`on` 等同）时未知电脑首次 `tconn` 会打印 `Connect OK`，但 `list targets` 为 Unauthorized，须本机确认台放行后才进入命令转发；「始终允许」写入 `known_hosts`。确认台只听回环（默认 127.0.0.1，非回环启动失败）；API 校验 Host/Origin 与启动时随机 token。日志只打印指纹，不能裁决。远程客户端 hdc 须 `Ver: 3.0.0b` 及以上（`hdc -v`），更低版本无法完成公钥握手。待确认连接仍占用该设备的并发连接名额。
+- **主信任边界仍含网络准入**：来源 CIDR 白名单（`HDC_REMOTE_ALLOWED_SOURCE_CIDRS`，默认 loopback + RFC1918 私网）+ 单设备并发上限 + 租约保险 TTL。只应对可信来源开放。
 - `HDC_REMOTE_PROXY_BIND_HOST` 默认 `0.0.0.0`（监听所有网卡），实际可达性由来源 CIDR 白名单收敛。放宽白名单到局域网或公网前，请自行评估暴露面并配合防火墙。
 - **命令策略是尽力而为的高危黑名单，不是完备沙箱**：`internal/policy` 拦截重启、刷写、remount、删除关键路径、改 HDC daemon 状态等已知破坏性操作，但不保证拦截所有恶意变体。可通过 `HDC_REMOTE_POLICY_PROFILE=restricted`（在默认之上额外禁网络下载/外连工具）与 `HDC_REMOTE_EXTRA_DENIED_EXECUTABLES`（追加禁止的可执行名）加严。配置中的非法档位会在启动时被拒绝；策略引擎对未知非空档位会 fail-safe 到最严 `restricted`。因此不要把本服务直接暴露到不可信网络，也不要把命令策略当作唯一安全防线。
-- 所有命令决策落盘结构化审计（`STATE_DIR/audit.jsonl`），审计不含文件内容、安装包内容与完整命令行。
+- 命令与握手决策落盘结构化审计（`STATE_DIR/audit.jsonl`），不含文件内容、安装包内容、完整命令行与 PEM；已解析公钥时带 `fingerprint`。
 
 ## 支持的版本
 

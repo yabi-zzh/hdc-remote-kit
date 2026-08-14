@@ -1,4 +1,4 @@
-// Package model 定义领域模型与状态枚举：Device、Binding、Lease、Grant、RemoteAccessView、Audit。
+// Package model 定义领域模型与状态枚举：Device、Binding、Lease、Grant、RemoteAccessView、LiveSession、Audit。
 // 仅承载数据、常量与状态定义，不含行为逻辑。
 package model
 
@@ -165,6 +165,17 @@ type RemoteAccessView struct {
 	LastRejectedCommandReason string `json:"last_rejected_command_reason,omitempty"`
 }
 
+// LiveSession 是一条已验签通过的远程 tconn，供确认台展示连接方身份。
+type LiveSession struct {
+	SessionID   string    `json:"session_id"`
+	DeviceID    string    `json:"device_id"`
+	Serial      string    `json:"serial"`
+	Hostname    string    `json:"hostname"`
+	Fingerprint string    `json:"fingerprint"`
+	SourceIP    string    `json:"source_ip"`
+	ConnectedAt time.Time `json:"connected_at"`
+}
+
 // AuditDecision 表示命令策略决策结果。
 type AuditDecision string
 
@@ -180,6 +191,7 @@ type Audit struct {
 	DeviceID          string        `json:"device_id"`
 	OwnerID           string        `json:"owner_id,omitempty"`
 	SourceIP          string        `json:"source_ip"`
+	Fingerprint       string        `json:"fingerprint,omitempty"`
 	CommandFlag       uint64        `json:"command_flag"`
 	CommandName       string        `json:"command_name"`
 	NormalizedCommand string        `json:"normalized_command,omitempty"`

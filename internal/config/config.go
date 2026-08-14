@@ -1,10 +1,11 @@
 // Package config 从环境变量加载并校验进程级配置，并套用偏安全的默认值。
-// 服务无控制面，所有运行参数仅通过 HDC_REMOTE_* 环境变量注入。
+// 运行参数通过 HDC_REMOTE_* 环境变量注入；本机确认台地址见 WebAddr。
 package config
 
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -13,6 +14,13 @@ import (
 	"time"
 
 	"github.com/yabi-zzh/hdc-remote-kit/internal/policy"
+)
+
+const (
+	// HostAuthConfirm 打开人工授权：未知公钥停在 Unauthorized，等本机确认台放行。
+	HostAuthConfirm = "confirm"
+	// HostAuthOff 关闭人工授权：未知公钥验签后直连，不写 known_hosts。
+	HostAuthOff = "off"
 )
 
 // Config 是进程级配置。服务无控制面，启动后自动为在线 USB 设备开启转发，配置仅通过环境变量注入。
@@ -31,7 +39,7 @@ type Config struct {
 	LeaseMaxTTL              time.Duration // 自动转发租约的保险 TTL，运行期持续刷新；服务异常停止刷新后租约到期自动关闭入口
 	MaxConnections           int
 	MaxChannelsPerConnection int
-	HandshakeTimeout         time.Duration // 已准入连接必须在此时间内完成握手，防止空连接长期占用并发名额
+	HandshakeTimeout         time.Duration // AUTH_NONE→公钥提交及放行后验签的时限；待确认期间会清掉，改由 AuthConfirmTimeout 约束
 	ShutdownTimeout          time.Duration // 优雅退出等待连接收敛的上限，超时则放弃等待直接退出
 	HostConnectTimeout       time.Duration
 	HostReadTimeout          time.Duration
@@ -41,11 +49,14 @@ type Config struct {
 	MaxTempBytes             int64
 	FileTransferTimeout      time.Duration
 	UnityStreamTimeout       time.Duration
-	PolicyProfile            string   // 命令策略档位：studio-debug（默认）或 restricted（更严）
-	ExtraDeniedExecutables   []string // 在内置规则之上追加禁止的 shell 可执行名（只能加严）
+	PolicyProfile            string        // 命令策略档位：studio-debug（默认）或 restricted（更严）
+	ExtraDeniedExecutables   []string      // 在内置规则之上追加禁止的 shell 可执行名（只能加严）
+	WebAddr                  string        // 本机确认台监听地址；空则不启动 Web，非回环启动失败
+	AuthConfirmTimeout       time.Duration // 未知公钥停在 Unauthorized 等待本机放行的时限
+	HostAuth                 string        // 默认 off：验签后直连；confirm：未知公钥等确认台
 }
 
-// Load 从环境变量读取配置并套用安全默认值（控制面默认 localhost、公网 daemon 默认必须显式白名单），最后经 validate 校验。
+// Load 从环境变量读取配置并套用安全默认值（确认台默认本机回环、来源 CIDR 默认 loopback + RFC1918），最后经 validate 校验。
 func Load() (Config, error) {
 	proxyPortMin, err := envInt("HDC_REMOTE_PROXY_PORT_MIN", 50000)
 	if err != nil {
@@ -115,10 +126,14 @@ func Load() (Config, error) {
 		UnityStreamTimeout:       durations.unityStream,
 		PolicyProfile:            strings.ToLower(envString("HDC_REMOTE_POLICY_PROFILE", string(policy.ProfileStudioDebug))),
 		ExtraDeniedExecutables:   envCSV("HDC_REMOTE_EXTRA_DENIED_EXECUTABLES", nil),
+		WebAddr:                  envStringAllowEmpty("HDC_REMOTE_WEB_ADDR", "127.0.0.1:18080"),
+		AuthConfirmTimeout:       durations.authConfirm,
+		HostAuth:                 envString("HDC_REMOTE_HOST_AUTH", HostAuthOff),
 	}
 	if err := validate(cfg); err != nil {
 		return Config{}, err
 	}
+	cfg.HostAuth, _ = ParseHostAuth(cfg.HostAuth)
 	return cfg, nil
 }
 
@@ -164,7 +179,60 @@ func validate(cfg Config) error {
 	if _, err := ParseLogLevel(cfg.LogLevel); err != nil {
 		return err
 	}
+	if cfg.AuthConfirmTimeout <= 0 {
+		return fmt.Errorf("auth confirm timeout must be positive")
+	}
+	if _, err := ParseHostAuth(cfg.HostAuth); err != nil {
+		return err
+	}
+	if err := ValidateWebAddr(cfg.WebAddr); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ParseHostAuth 归一化主机授权模式。空值视为 off。
+func ParseHostAuth(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case HostAuthConfirm, "on":
+		return HostAuthConfirm, nil
+	case "", HostAuthOff:
+		return HostAuthOff, nil
+	default:
+		return "", fmt.Errorf("invalid host auth %q (want confirm|off)", value)
+	}
+}
+
+// ValidateWebAddr 要求确认台只绑回环；空地址表示关闭确认台。
+func ValidateWebAddr(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid web addr %q: %w", addr, err)
+	}
+	if strings.TrimSpace(port) == "" {
+		return fmt.Errorf("web addr %q is missing a port", addr)
+	}
+	if !IsLoopbackHost(host) {
+		return fmt.Errorf("web addr %q must bind to loopback", addr)
+	}
+	return nil
+}
+
+// IsLoopbackHost 判定主机名是否为本机回环（含 localhost）。空主机（如 :18080）会绑到所有网卡，不是回环。
+func IsLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 // ParseLogLevel 将配置字符串解析为 slog.Level。
@@ -228,6 +296,15 @@ func envString(name, fallback string) string {
 	return fallback
 }
 
+// envStringAllowEmpty 在变量已设置时保留空值（用于关掉确认台）；未设置才用 fallback。
+func envStringAllowEmpty(name, fallback string) string {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback
+	}
+	return strings.TrimSpace(value)
+}
+
 func envInt(name string, fallback int) (int, error) {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -263,6 +340,7 @@ type durationSettings struct {
 	hostRead     time.Duration
 	fileTransfer time.Duration
 	unityStream  time.Duration
+	authConfirm  time.Duration
 }
 
 // durationSpec 把一个时长环境变量绑定到它的默认值与目标字段。
@@ -284,6 +362,7 @@ func loadDurations() (durationSettings, error) {
 		{"HDC_REMOTE_HOST_READ_TIMEOUT", 5 * time.Second, &settings.hostRead},
 		{"HDC_REMOTE_FILE_TRANSFER_TIMEOUT", 10 * time.Minute, &settings.fileTransfer},
 		{"HDC_REMOTE_UNITY_STREAM_TIMEOUT", 30 * time.Minute, &settings.unityStream},
+		{"HDC_REMOTE_AUTH_CONFIRM_TIMEOUT", 90 * time.Second, &settings.authConfirm},
 	}
 	for _, spec := range specs {
 		value, err := envDuration(spec.name, spec.fallback)

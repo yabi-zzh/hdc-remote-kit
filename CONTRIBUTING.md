@@ -26,7 +26,7 @@ CI 会在 PR 上重复执行 gofmt 检查、`go vet`、构建、`go test -race` 
 - 严格 `gofmt`，导出符号必须有文档注释。
 - 注释使用中文；代码标识符、命令、路径、日志保持原语言。
 - 注释解释业务意图、边界条件与风险取舍，不复述表面代码行为。
-- 遵循既有分层：`cmd → remote/gateway/... → protocol/bridge/hdc`，禁止跨层调用。
+- 遵循既有分层：`cmd → remote / gateway / hostauth / web → protocol / bridge / hdc`，禁止跨层调用。
 - 显式错误处理，资源（连接、文件、goroutine）必须有明确释放路径。
 - 安全相关改动遵循 fail-closed 原则：未知命令、越界输入、不支持的能力一律拒绝。
 

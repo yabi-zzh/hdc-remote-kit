@@ -1,5 +1,5 @@
 // Package gateway 是公网 daemon 入口：为每个授权 Binding 开 TCP listener，握手前做来源/并发/TTL admission，
-// 握手后按协议族把帧路由到各 bridge，再经主 HDC target channel 抵达设备。
+// 公钥握手（未知主机先 Unauthorized）通过后按协议族把帧路由到各 bridge，再经主 HDC target channel 抵达设备。
 package gateway
 
 import (
@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/yabi-zzh/hdc-remote-kit/internal/bridge"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/config"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/hdc"
+	"github.com/yabi-zzh/hdc-remote-kit/internal/hostauth"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/model"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/policy"
 	"github.com/yabi-zzh/hdc-remote-kit/internal/protocol"
@@ -38,7 +40,7 @@ type ConnectionObserver interface {
 }
 
 // Gateway 是公网 daemon 入口：为每个已授权 Binding 开一个 TCP listener，握手前做 admission（TTL/来源/并发），
-// 握手后按协议族把帧路由到各 bridge，再经主 HDC target channel 抵达设备。每设备一个 listener，连接级并发隔离。
+// 公钥握手通过后按协议族把帧路由到各 bridge。待确认连接仍占用 MaxConnections。每设备一个 listener，连接级并发隔离。
 type Gateway struct {
 	cfg          config.Config
 	resolver     DeviceResolver
@@ -46,6 +48,7 @@ type Gateway struct {
 	host         *hdc.HostClient
 	codec        *protocol.Codec
 	policyEngine *policy.Policy
+	hosts        *hostauth.Registry
 	recorder     audit.Recorder
 	logger       *slog.Logger
 
@@ -57,16 +60,90 @@ type Gateway struct {
 	listeners map[string]*listenerState
 	closed    bool
 	wg        sync.WaitGroup
+
+	sessionMu sync.Mutex
+	sessions  map[string]liveSession
 }
 
+type liveSession struct {
+	view   model.LiveSession
+	closer func()
+}
+
+// ErrSessionNotFound 表示没有这条已验签会话。
+var ErrSessionNotFound = errors.New("live session not found")
+
 // New 构造 gateway；recorder 可为 nil（不记审计），resolver/observer 通常均为 remote.Manager。
-func New(cfg config.Config, resolver DeviceResolver, observer ConnectionObserver, host *hdc.HostClient, recorder audit.Recorder, logger *slog.Logger) *Gateway {
+func New(cfg config.Config, resolver DeviceResolver, observer ConnectionObserver, host *hdc.HostClient, hosts *hostauth.Registry, recorder audit.Recorder, logger *slog.Logger) *Gateway {
 	return &Gateway{
-		cfg: cfg, resolver: resolver, observer: observer, host: host,
+		cfg: cfg, resolver: resolver, observer: observer, host: host, hosts: hosts,
 		codec: protocol.NewCodec(cfg.MaxDaemonFrameBytes), recorder: recorder, logger: logger,
 		policyEngine: policy.New(policy.Config{ExtraDeniedExecutables: cfg.ExtraDeniedExecutables}),
 		listeners:    make(map[string]*listenerState),
+		sessions:     make(map[string]liveSession),
 	}
+}
+
+// Sessions 返回当前已验签的远程连接副本，按接入时间排序。
+func (g *Gateway) Sessions() []model.LiveSession {
+	g.sessionMu.Lock()
+	defer g.sessionMu.Unlock()
+	result := make([]model.LiveSession, 0, len(g.sessions))
+	for _, session := range g.sessions {
+		result = append(result, session.view)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ConnectedAt.Before(result[j].ConnectedAt) })
+	return result
+}
+
+// Kick 主动拆掉一条已验签会话；不撤销 known_hosts，对方可再连。
+func (g *Gateway) Kick(sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+	g.sessionMu.Lock()
+	session, ok := g.sessions[sessionID]
+	delete(g.sessions, sessionID)
+	g.sessionMu.Unlock()
+	if !ok {
+		return ErrSessionNotFound
+	}
+	if session.closer != nil {
+		session.closer()
+	}
+	if g.hosts != nil {
+		g.hosts.Record(hostauth.RecentEvent{
+			Action: "kick", Hostname: session.view.Hostname, Fingerprint: session.view.Fingerprint,
+			SourceIP: session.view.SourceIP, Serial: session.view.Serial,
+		})
+	}
+	if g.logger != nil {
+		g.logger.Info("session kicked",
+			"serial", session.view.Serial,
+			"host", session.view.Hostname,
+			"source", session.view.SourceIP,
+			"session_id", sessionID)
+	}
+	return nil
+}
+
+func (g *Gateway) trackSession(session model.LiveSession, closer func()) {
+	if session.SessionID == "" {
+		return
+	}
+	g.sessionMu.Lock()
+	if g.sessions == nil {
+		g.sessions = make(map[string]liveSession)
+	}
+	g.sessions[session.SessionID] = liveSession{view: session, closer: closer}
+	g.sessionMu.Unlock()
+}
+
+func (g *Gateway) dropSession(sessionID string) {
+	g.sessionMu.Lock()
+	delete(g.sessions, sessionID)
+	g.sessionMu.Unlock()
 }
 
 // Bind 依据 Grant 为某 Binding 启动 TCP listener 并开始 accept；校验 Grant 完整性、幂等（已存在则跳过）、关闭后拒绝。
@@ -249,16 +326,10 @@ func (g *Gateway) acceptLoop(state *listenerState) {
 		g.logger.Info("connection accepted",
 			"serial", model.DeviceSerial(grant.Binding.DeviceID),
 			"remote", conn.RemoteAddr().String())
-		if g.observer != nil {
-			g.observer.ConnectionOpened(grant.LeaseID)
-		}
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()
 			defer state.removeConnection(conn)
-			if g.observer != nil {
-				defer g.observer.ConnectionClosed(grant.LeaseID)
-			}
 			g.handleConnection(grant, conn)
 		}()
 	}
@@ -269,20 +340,45 @@ func (g *Gateway) acceptLoop(state *listenerState) {
 func (g *Gateway) handleConnection(grant model.Grant, conn net.Conn) {
 	binding := grant.Binding
 	ctx, cancel := context.WithCancel(context.Background())
-	remote := &daemonConnection{
+	opened := false
+	connectionID := newConnectionID()
+	peerIP := sourceIP(conn.RemoteAddr())
+	var remote *daemonConnection
+	remote = &daemonConnection{
 		ctx: ctx, cancel: cancel, conn: conn, binding: binding,
 		resolver: g.resolver, host: g.host, codec: g.codec, logger: g.logger,
 		recorder:         g.recorder,
+		hosts:            g.hosts,
 		leaseID:          grant.LeaseID,
 		ownerID:          grant.OwnerID,
-		sourceIP:         sourceIP(conn.RemoteAddr()),
-		connectionID:     newConnectionID(),
+		sourceIP:         peerIP,
+		connectionID:     connectionID,
 		shells:           make(map[uint32]*shellSession),
 		openChannels:     make(map[uint32]struct{}),
 		maxChannels:      g.cfg.MaxChannelsPerConnection,
 		handshakeTimeout: g.cfg.HandshakeTimeout,
+		hostAuthOff:      g.cfg.HostAuth == config.HostAuthOff,
 		policyEngine:     g.policyEngine,
 		policyProfile:    policy.Profile(grant.PolicyProfile),
+		onAuthed: func() {
+			opened = true
+			g.trackSession(model.LiveSession{
+				SessionID:   connectionID,
+				DeviceID:    binding.DeviceID,
+				Serial:      model.DeviceSerial(binding.DeviceID),
+				Hostname:    remote.authIdentity.Hostname,
+				Fingerprint: remote.authIdentity.Fingerprint,
+				SourceIP:    peerIP,
+				ConnectedAt: time.Now().UTC(),
+			}, func() {
+				remote.setCloseReason("kicked")
+				cancel()
+				_ = conn.Close()
+			})
+			if g.observer != nil {
+				g.observer.ConnectionOpened(grant.LeaseID)
+			}
+		},
 	}
 	fileTempRoot := filepath.Join(g.cfg.StateDir, "transfers")
 	tempStore, err := g.transferTempStore(fileTempRoot)
@@ -325,9 +421,20 @@ func (g *Gateway) handleConnection(grant model.Grant, conn net.Conn) {
 	remote.forwardBridge.SetLogger(g.logger)
 
 	remote.run()
+	g.dropSession(remote.connectionID)
+	if opened && g.observer != nil {
+		g.observer.ConnectionClosed(grant.LeaseID)
+	} else if !opened && g.observer != nil && remote.authRejectReason != "" {
+		g.observer.ConnectionRejected(grant.LeaseID, remote.authRejectReason)
+	}
+	reason := remote.currentCloseReason()
+	if reason == "" {
+		reason = "peer"
+	}
 	g.logger.Info("connection closed",
 		"serial", model.DeviceSerial(binding.DeviceID),
-		"remote", conn.RemoteAddr().String())
+		"remote", conn.RemoteAddr().String(),
+		"reason", reason)
 }
 
 type listenerState struct {
@@ -454,6 +561,17 @@ type daemonConnection struct {
 	writeMu           sync.Mutex
 	handshakeAccepted bool
 	handshakeTimeout  time.Duration
+	hostAuthOff       bool
+	hosts             *hostauth.Registry
+	authPhase         authPhase
+	authType          hostauth.AuthType
+	authToken         string
+	authIdentity      hostauth.HostIdentity
+	handshakeVersion  string
+	authRejectReason  string
+	closeOnce         sync.Once
+	closeReason       string
+	onAuthed          func()
 	policyEngine      *policy.Policy
 	policyProfile     policy.Profile
 	channelMu         sync.Mutex
@@ -488,6 +606,7 @@ func (c *daemonConnection) run() {
 		}
 		rawFrame, err := c.codec.ReadFrame(c.conn)
 		if err != nil {
+			c.setCloseReason(classifyReadEnd(err))
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				c.logger.Debug("HDC daemon read ended", "serial", model.DeviceSerial(c.binding.DeviceID), "error", err)
 			}
@@ -499,6 +618,9 @@ func (c *daemonConnection) run() {
 			return
 		}
 		if err := c.route(frame); err != nil {
+			if errors.Is(err, errHostAuthRejected) {
+				return
+			}
 			c.logger.Warn("HDC daemon command failed", "serial", model.DeviceSerial(c.binding.DeviceID), "command", frame.CommandName, "error", err)
 			var violation *daemonProtocolViolation
 			if errors.As(err, &violation) {
@@ -518,6 +640,38 @@ type daemonProtocolViolation struct {
 
 func (e *daemonProtocolViolation) Error() string {
 	return e.message
+}
+
+// errHostAuthRejected 表示已把拒绝/超时通知写给对端，主循环应直接拆 TCP，不要再补一条通用失败帧。
+var errHostAuthRejected = errors.New("host authentication rejected")
+
+// setCloseReason 记录本连接关闭原因，只写一次。取值：version_too_old / timeout / deny / kicked / peer。
+func (c *daemonConnection) setCloseReason(reason string) {
+	if c == nil || reason == "" {
+		return
+	}
+	c.closeOnce.Do(func() { c.closeReason = reason })
+}
+
+func (c *daemonConnection) currentCloseReason() string {
+	if c == nil {
+		return ""
+	}
+	return c.closeReason
+}
+
+func classifyReadEnd(err error) string {
+	if err == nil {
+		return ""
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+		return ""
+	}
+	return "peer"
 }
 
 // shouldLogDaemonFrame 过滤高频噪声帧与已有更具体日志覆盖的帧。
@@ -540,6 +694,12 @@ func shouldLogDaemonFrame(flag protocol.Command) bool {
 	}
 }
 
+// allowedBeforeHandshake 允许官方 hdc 在多轮公钥握手之间发送的收尾帧。
+// 每轮 KernelHandshake 之后对端会立刻 KernelChannelClose；验签完成前 handshakeAccepted 仍为 false。
+func allowedBeforeHandshake(flag protocol.Command) bool {
+	return flag == protocol.CommandKernelHandshake || flag == protocol.CommandKernelChannelClose
+}
+
 // route 是帧分发核心：强制先握手、拒绝重复握手、帧级策略黑名单拦截，随后按命令族分派到对应处理器/ bridge；
 // 未接入的族回 fail-closed。可审计的命令发起帧在此记 ALLOWED（shell 族在 handleShell 内单独记，避免重复）。
 func (c *daemonConnection) route(frame protocol.Frame) error {
@@ -550,7 +710,7 @@ func (c *daemonConnection) route(frame protocol.Frame) error {
 			"command", frame.CommandName,
 			"payload_bytes", len(frame.Payload))
 	}
-	if !c.handshakeAccepted && frame.CommandFlag != protocol.CommandKernelHandshake {
+	if !c.handshakeAccepted && !allowedBeforeHandshake(frame.CommandFlag) {
 		c.audit(frame, model.AuditRejected, "handshake required")
 		return &daemonProtocolViolation{message: "HDC daemon handshake is required."}
 	}
@@ -607,19 +767,7 @@ func (c *daemonConnection) route(frame protocol.Frame) error {
 func (c *daemonConnection) handleKernel(frame protocol.Frame) error {
 	switch frame.CommandFlag {
 	case protocol.CommandKernelHandshake:
-		handshake, err := c.codec.DecodeSessionHandshake(frame.Payload)
-		if err != nil || handshake.Banner != "OHOS HDC" || handshake.AuthType != protocol.HandshakeAuthNone {
-			c.audit(frame, model.AuditRejected, "invalid handshake")
-			return &daemonProtocolViolation{message: "Invalid HDC daemon handshake."}
-		}
-		c.audit(frame, model.AuditAllowed, "")
-		c.handshakeAccepted = true
-		if c.logger != nil {
-			c.logger.Debug("HDC daemon handshake accepted", "serial", model.DeviceSerial(c.binding.DeviceID), "remote", c.sourceIP)
-		}
-		response := c.codec.EncodeHandshakeOK(frame, handshake, c.binding.DeviceID)
-		response = append(response, c.codec.EncodeChannelClose(frame.ChannelID)...)
-		return c.write(response)
+		return c.handleHandshake(frame)
 	case protocol.CommandKernelChannelClose:
 		c.teardownChannel(frame.ChannelID)
 		return c.write(c.codec.EncodeChannelCloseResponse(frame.ChannelID, frame.Payload))

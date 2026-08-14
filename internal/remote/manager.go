@@ -292,6 +292,22 @@ func (m *Manager) AutoExpose(ctx context.Context) {
 	}
 }
 
+// Views 投影当前设备远程接入状态，供本机确认台展示。
+func (m *Manager) Views() []model.RemoteAccessView {
+	devices, err := m.registry.Devices()
+	if err != nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	views := make([]model.RemoteAccessView, 0, len(devices))
+	for _, device := range devices {
+		views = append(views, m.buildViewLocked(device, ""))
+	}
+	sort.Slice(views, func(i, j int) bool { return views[i].DeviceID < views[j].DeviceID })
+	return views
+}
+
 // ResolveOnlineConnectKey 供 gateway 在每次打开 target channel 时把 deviceID 解析为当前在线 USB 设备的 connectKey。
 func (m *Manager) ResolveOnlineConnectKey(_ context.Context, deviceID string) (string, error) {
 	device, err := m.registry.ResolveOnlineUSB(deviceID)

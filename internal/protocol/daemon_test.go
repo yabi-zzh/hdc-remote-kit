@@ -107,6 +107,51 @@ func TestHandshakeUsesOfficialDaemonResponseSemantics(t *testing.T) {
 	}
 }
 
+func TestClientVersionTooOld(t *testing.T) {
+	if ClientVersionTooOld("") || ClientVersionTooOld("not-a-version") {
+		t.Fatal("empty or unparseable version must not be rejected")
+	}
+	if !ClientVersionTooOld("Ver: 2.0.0") || !ClientVersionTooOld("Ver: 3.0.0a") {
+		t.Fatal("versions below Ver: 3.0.0b must be rejected")
+	}
+	if ClientVersionTooOld(HandshakeMinAuthVersion) || ClientVersionTooOld("Ver: 3.1.0e") {
+		t.Fatal("Ver: 3.0.0b and newer must be accepted")
+	}
+	if ClientVersionTooOld("Ver: 10.0.0") || ClientVersionTooOld("Ver: 3.2.0c-buildhash") {
+		t.Fatal("major 10 and build-suffixed 3.2.0c must be accepted")
+	}
+}
+
+func TestParseHandshakeTLVRoundTrip(t *testing.T) {
+	buffer := AppendHandshakeTLV("", HandshakeTLVAuthType, HandshakeAuthTypeSHA512)
+	fields, err := ParseHandshakeTLV(buffer)
+	if err != nil {
+		t.Fatalf("ParseHandshakeTLV() error = %v", err)
+	}
+	if fields[HandshakeTLVAuthType] != HandshakeAuthTypeSHA512 {
+		t.Fatalf("fields = %+v", fields)
+	}
+}
+
+func TestEncodeHandshakeUnauthorizedUsesOfficialStatus(t *testing.T) {
+	codec := NewCodec(2048)
+	raw, err := codec.ReadFrame(bytes.NewReader(codec.EncodeHandshakeUnauthorized(0, "Ver: 3.2.0c", "device-1", "wait")))
+	if err != nil {
+		t.Fatalf("ReadFrame() error = %v", err)
+	}
+	frame, err := codec.Decode(raw)
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	handshake, err := codec.DecodeSessionHandshake(frame.Payload)
+	if err != nil {
+		t.Fatalf("DecodeSessionHandshake() error = %v", err)
+	}
+	if handshake.AuthType != HandshakeAuthOK || !bytes.Contains([]byte(handshake.Buffer), []byte(DaemonAuthUnauthorized)) {
+		t.Fatalf("unauthorized handshake = %+v", handshake)
+	}
+}
+
 func TestHandshakeUsesFallbackVersionForVersionlessHost(t *testing.T) {
 	codec := NewCodec(1024)
 	requestFrame := Frame{ChannelID: 0}

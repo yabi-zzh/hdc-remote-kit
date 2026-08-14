@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hdc-remote 远程授权</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fragment+Mono:ital@0;1&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --ink: #0b0d0c;
+      --card: #171d1a;
+      --well: #101412;
+      --line: #3a4540;
+      --brass: #d4b072;
+      --signal: #6fdb9a;
+      --alarm: #e87858;
+      --trust: #7eb8a4;
+      --fog: #d7dfd9;
+      --mute: #8b978f;
+      --paper: #f3efe6;
+      --allow-bg: #13241c;
+      --once-bg: #241e14;
+      --deny-bg: #261610;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--ink); color: var(--fog); }
+    body {
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      font-family: "Fragment Mono", ui-monospace, monospace;
+      font-size: 15px;
+      line-height: 1.45;
+      background-image:
+        radial-gradient(900px 380px at 6% -10%, rgba(212, 176, 114, 0.07), transparent 55%),
+        radial-gradient(700px 280px at 96% 0%, rgba(126, 184, 164, 0.04), transparent 48%),
+        linear-gradient(180deg, rgba(255,255,255,0.025), transparent 30%);
+    }
+    body::after {
+      content: "";
+      pointer-events: none;
+      position: fixed;
+      inset: 0;
+      opacity: 0.035;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    header {
+      padding: 20px 48px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .title-row { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; }
+    h1 {
+      font-family: "Instrument Serif", serif;
+      font-weight: 400; font-size: 34px; margin: 0; color: var(--paper); letter-spacing: -0.03em;
+    }
+    .stamp { color: var(--mute); font-size: 13px; flex-shrink: 0; letter-spacing: 0.04em; }
+    .stamp.err { color: var(--alarm); }
+    .stamp.ok { color: var(--signal); }
+    .lede {
+      margin: 8px 0 0; color: var(--mute); font-size: 13px; line-height: 1.55;
+    }
+    .lede code { color: var(--paper); font: inherit; }
+    .lede b { color: var(--fog); font-weight: 400; }
+    main {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.7fr);
+      gap: 16px 20px;
+      padding: 18px 48px 20px;
+    }
+    .stack { display: flex; flex-direction: column; gap: 16px; min-height: 0; height: 100%; }
+    .block-head {
+      display: flex; align-items: baseline; gap: 10px;
+      margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid rgba(63, 76, 70, 0.7);
+    }
+    h2 {
+      font-family: "Instrument Serif", serif; font-size: 23px; color: var(--paper);
+      margin: 0; font-weight: 400;
+    }
+    .count { color: var(--mute); font-size: 14px; }
+    .count.hot {
+      color: var(--alarm);
+      background: rgba(232, 120, 88, 0.12);
+      padding: 1px 7px;
+    }
+    .ticket {
+      background: var(--well);
+      border: 1px solid var(--line);
+      padding: 12px 14px 13px;
+      animation: rise 160ms ease;
+    }
+    .ticket + .ticket { margin-top: 8px; }
+    .ticket.pending { background: #161210; border-color: #5a3d34; }
+    .ticket.live { background: #101612; border-color: #2f4a3a; }
+    .ticket-head { display: flex; justify-content: space-between; align-items: center; gap: 14px; }
+    .host { color: var(--paper); font-size: 16px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ticket .host {
+      display: flex; align-items: center; gap: 10px; font-size: 18px;
+    }
+    .ticket .host::before {
+      content: ""; width: 6px; height: 6px; flex-shrink: 0;
+      transform: rotate(45deg); background: var(--brass);
+    }
+    .ticket.pending .host::before { background: var(--alarm); }
+    .ticket.live .host::before { background: var(--signal); }
+    .sub { color: var(--mute); font-size: 13px; margin-top: 3px; line-height: 1.4; }
+    .facts {
+      display: flex; flex-wrap: wrap; gap: 14px 22px;
+      margin-top: 10px; padding-top: 9px;
+      border-top: 1px dashed rgba(63, 76, 70, 0.8);
+    }
+    .facts i { display: block; font-style: normal; color: var(--mute); font-size: 11px; letter-spacing: 0.08em; margin-bottom: 3px; }
+    .facts b { font-weight: 400; color: var(--paper); font-size: 13px; word-break: break-all; }
+    .fp { color: var(--signal); letter-spacing: 0.04em; }
+    button.fp {
+      border: 0; padding: 0; background: transparent; color: var(--signal);
+      font-size: 13px; letter-spacing: 0.04em;
+    }
+    button.fp:hover { background: transparent; color: var(--paper); }
+    .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+    button {
+      font: inherit; font-size: 13px; border: 1px solid var(--line); background: transparent; color: var(--paper);
+      padding: 6px 12px; cursor: pointer; letter-spacing: 0.02em;
+    }
+    button.allow { background: var(--allow-bg); border-color: var(--signal); color: var(--signal); }
+    button.once { border-color: var(--brass); color: var(--brass); }
+    button.deny, button.revoke { border-color: #8a4e3d; color: var(--alarm); }
+    button:hover { background: rgba(243, 239, 230, 0.04); }
+    button.allow:hover { background: #183226; }
+    button.once:hover { background: var(--once-bg); }
+    button.deny:hover, button.revoke:hover { background: var(--deny-bg); }
+    button:disabled { opacity: 0.45; cursor: default; }
+    button:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+    .empty { margin: 2px 0 0; color: var(--mute); font-size: 13px; }
+    .side-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-left: 2px solid var(--brass);
+      padding: 14px 16px 16px;
+    }
+    .zone-pending { border-left-color: var(--alarm); flex: 0 1 auto; max-height: calc(100% - 8.5rem); min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .zone-live { border-left-color: var(--signal); flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .zone-device { border-left-color: var(--brass); flex: 0 0 auto; }
+    .zone-keys { border-left-color: var(--trust); flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .list { overflow-y: auto; min-height: 0; }
+    .list::-webkit-scrollbar { width: 8px; }
+    .list::-webkit-scrollbar-thumb { background: var(--line); }
+    .row {
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      padding: 10px 0; border-bottom: 1px dashed rgba(63, 76, 70, 0.75);
+    }
+    .row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .row:first-child { padding-top: 0; }
+    .ok { color: var(--signal); }
+    .ready { color: var(--brass); }
+    .wait { color: var(--alarm); }
+    .dim { color: var(--mute); }
+    .status { font-size: 13px; text-align: right; white-space: nowrap; }
+    #notices:not(:empty) { padding: 14px 48px 0; display: flex; flex-direction: column; gap: 8px; }
+    .notice-bar {
+      display: flex; justify-content: space-between; align-items: center; gap: 16px;
+      background: #161210; border: 1px solid #5a3d34; padding: 10px 14px;
+    }
+    .notice-bar .host { font-size: 16px; }
+    .notice-bar .sub { margin-top: 3px; }
+    .notice-meta { color: var(--mute); font-size: 12px; margin-top: 6px; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(5px); }
+      to { opacity: 1; transform: none; }
+    }
+    @media (max-width: 960px) {
+      header, main, #notices:not(:empty) { padding-left: 20px; padding-right: 20px; }
+      body { height: auto; overflow: auto; }
+      main { grid-template-columns: 1fr; height: auto; }
+      .stack { height: auto; }
+      .zone-pending { max-height: none; }
+      .zone-live { max-height: 50vh; flex: none; }
+      .ticket-head { flex-direction: column; align-items: stretch; }
+      .actions { justify-content: flex-start; }
+      .notice-bar { flex-direction: column; align-items: stretch; }
+      .host { white-space: normal; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <h1>远程授权</h1>
+      <div class="stamp" id="stamp">SYNC</div>
+    </div>
+    <p class="lede" id="lede">对端 hdc 须 <code data-min-hdc>Ver: 3.0.0b</code> 及以上（<code>hdc -v</code>）。<b>未知公钥先 Unauthorized，在此放行</b> · 白名单直接过 · 不用输码</p>
+  </header>
+  <div id="notices"></div>
+  <main>
+    <div class="stack">
+      <section class="side-card zone-pending">
+        <div class="block-head">
+          <h2>待确认</h2>
+          <span class="count" id="pending-count">0</span>
+        </div>
+        <div id="pending" class="list"></div>
+      </section>
+      <section class="side-card zone-live">
+        <div class="block-head">
+          <h2>当前连接</h2>
+          <span class="count" id="session-count">0</span>
+        </div>
+        <div id="sessions" class="list"></div>
+      </section>
+    </div>
+    <aside class="stack">
+      <section class="side-card zone-device">
+        <div class="block-head">
+          <h2>设备</h2>
+          <span class="count" id="device-count">0</span>
+        </div>
+        <div id="devices"></div>
+      </section>
+      <section class="side-card zone-keys">
+        <div class="block-head">
+          <h2>白名单</h2>
+          <span class="count" id="key-count">0</span>
+        </div>
+        <div id="keys" class="list"></div>
+      </section>
+    </aside>
+  </main>
+  <script>
+    const CONSOLE_TOKEN = "__HDC_CONSOLE_TOKEN__";
+    const shortFP = (fp) => {
+      const text = fp || "";
+      return text.length > 16 ? text.slice(0, 16) + "…" : text;
+    };
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[ch]));
+    const remoteLabel = {
+      CONNECTED: "已接入", CONNECTABLE: "可连接", NOT_ENABLED: "未转发",
+      RELEASING: "释放中", RELEASED: "已释放", FAILED: "失败"
+    };
+    const usbLabel = { ONLINE: "USB 在线", OFFLINE: "USB 离线", UNAUTHORIZED: "USB 未授权", UNKNOWN: "未知" };
+    const remoteClass = { CONNECTED: "ok", CONNECTABLE: "ready", FAILED: "wait", RELEASING: "wait" };
+    let hostAuth = "off";
+    const cache = {};
+    let stampTimer = 0;
+    function changed(key, value) {
+      const raw = JSON.stringify(value);
+      if (cache[key] === raw) return false;
+      cache[key] = raw;
+      return true;
+    }
+    function setCount(id, n, hot) {
+      const node = document.getElementById(id);
+      node.textContent = String(n);
+      node.className = hot && n > 0 ? "count hot" : "count";
+    }
+    function setStamp(text, kind) {
+      const stamp = document.getElementById("stamp");
+      stamp.textContent = text;
+      stamp.className = kind ? "stamp " + kind : "stamp";
+    }
+    function flashStamp(text, kind, ms) {
+      clearTimeout(stampTimer);
+      setStamp(text, kind);
+      stampTimer = setTimeout(() => {
+        setStamp(new Date().toLocaleTimeString(), "");
+      }, ms);
+    }
+    async function copyFingerprint(value) {
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        flashStamp("已复制指纹", "ok", 1800);
+      } catch {
+        flashStamp("复制失败", "err", 2400);
+      }
+    }
+    async function decide(path, body, button, done) {
+      if (button) button.disabled = true;
+      try {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-HDC-Console-Token": CONSOLE_TOKEN
+          },
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+          flashStamp((await response.text()) || response.statusText, "err", 3200);
+        } else if (done) {
+          flashStamp(done.text, done.kind, 2400);
+        }
+      } catch (err) {
+        flashStamp(err.message || "请求失败", "err", 3200);
+      }
+      await refresh();
+    }
+    function fpButton(fp) {
+      return `<button type="button" class="fp" data-copy="${esc(fp)}" title="点击复制">${esc(shortFP(fp))}</button>`;
+    }
+    function facts(item) {
+      return `
+        <div class="facts">
+          <div><i>指纹</i>${fpButton(item.fingerprint)}</div>
+          <div><i>来源</i><b>${esc(item.source_ip)}</b></div>
+          <div><i>设备</i><b>${esc(item.serial || item.device_id)}</b></div>
+        </div>`;
+    }
+    function formatHdcVersion(version) {
+      const text = String(version || "").trim();
+      const match = text.match(/^(Ver:\s*\d+\.\d+\.\d+[a-zA-Z]?)([0-9a-fA-F]{7,})$/);
+      if (!match) return text || "未知";
+      return match[1] + " · " + match[2].slice(0, 8);
+    }
+    function newestFirst(items) {
+      return items.slice().sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+    }
+    function renderNotices(items) {
+      items = newestFirst(items);
+      if (!changed("notices", items)) return;
+      const root = document.getElementById("notices");
+      if (!items.length) {
+        root.innerHTML = "";
+        return;
+      }
+      root.innerHTML = items.map((item) => `
+        <div class="notice-bar">
+          <div>
+            <div class="host">hdc 版本过低</div>
+            <div class="sub">${esc(item.message || "本机不能放行。通知对端升级 hdc 后重连。")}</div>
+            <div class="notice-meta">${esc(formatHdcVersion(item.version))} · ${esc(item.source_ip)} · ${esc(item.serial)}</div>
+          </div>
+          <div class="actions">
+            <button class="once" data-notice="${esc(item.notice_id)}">知道了</button>
+          </div>
+        </div>`).join("");
+    }
+    function renderPending(items) {
+      items = newestFirst(items);
+      if (!changed("pending", { items, hostAuth })) return;
+      setCount("pending-count", items.length, true);
+      const root = document.getElementById("pending");
+      if (!items.length) {
+        root.innerHTML = hostAuth === "off"
+          ? '<p class="empty">授权已关闭，无需确认。</p>'
+          : '<p class="empty">没有等待中的连接。</p>';
+        return;
+      }
+      root.innerHTML = items.map((item) => `
+        <article class="ticket pending">
+          <div class="ticket-head">
+            <div class="host">${esc(item.hostname || "未知主机")}</div>
+            <div class="actions">
+              <button class="allow" data-act="allow" data-id="${esc(item.request_id)}">始终允许</button>
+              <button class="once" data-act="once" data-id="${esc(item.request_id)}">仅当次</button>
+              <button class="deny" data-act="deny" data-id="${esc(item.request_id)}">拒绝</button>
+            </div>
+          </div>
+          ${facts(item)}
+        </article>`).join("");
+    }
+    function renderSessions(items) {
+      if (!changed("sessions", items)) return;
+      setCount("session-count", items.length, false);
+      const root = document.getElementById("sessions");
+      if (!items.length) {
+        root.innerHTML = '<p class="empty">没有已放行的远程会话。</p>';
+        return;
+      }
+      root.innerHTML = items.map((item) => `
+        <article class="ticket live">
+          <div class="ticket-head">
+            <div class="host">${esc(item.hostname || "未知主机")}</div>
+            <div class="actions">
+              <button class="revoke" data-session="${esc(item.session_id)}" title="只断开当前会话，不撤白名单">踢出</button>
+            </div>
+          </div>
+          ${facts(item)}
+        </article>`).join("");
+    }
+    function renderDevices(items) {
+      const active = items.filter((item) => item.remote_access_status && item.remote_access_status !== "NOT_ENABLED");
+      if (!changed("devices", active)) return;
+      setCount("device-count", active.length, false);
+      const root = document.getElementById("devices");
+      if (!active.length) {
+        root.innerHTML = '<p class="empty">暂无已开转发的设备。</p>';
+        return;
+      }
+      root.innerHTML = active.map((item) => `
+        <div class="row">
+          <div>
+            <div class="host">${esc(item.device_name || item.device_id)}</div>
+            <div class="sub">${esc(item.connect_command || "")}</div>
+          </div>
+          <div class="status ${remoteClass[item.remote_access_status] || "dim"}">
+            ${esc(remoteLabel[item.remote_access_status] || item.remote_access_status)}<br>
+            <span class="dim">${esc(usbLabel[item.usb_status] || item.usb_status)}</span>
+          </div>
+        </div>`).join("");
+    }
+    function renderKeys(items) {
+      if (!changed("keys", items)) return;
+      setCount("key-count", items.length, false);
+      const root = document.getElementById("keys");
+      if (!items.length) {
+        root.innerHTML = '<p class="empty">白名单为空。</p>';
+        return;
+      }
+      root.innerHTML = items.map((item) => `
+        <div class="row">
+          <div>
+            <div class="host">${esc(item.hostname)}</div>
+            ${fpButton(item.fingerprint)}
+          </div>
+          <button class="revoke" data-fp="${esc(item.fingerprint)}">撤销</button>
+        </div>`).join("");
+    }
+    function applyLede(data) {
+      const lede = document.getElementById("lede");
+      const min = esc(data.min_hdc_version || "Ver: 3.0.0b");
+      if (data.host_auth === "off") {
+        lede.innerHTML = `对端 hdc 须 <code data-min-hdc>${min}</code> 及以上（<code>hdc -v</code>）。<b>授权已关闭，验签后直接进</b> · 确认台只看会话`;
+        return;
+      }
+      lede.innerHTML = `对端 hdc 须 <code data-min-hdc>${min}</code> 及以上（<code>hdc -v</code>）。<b>未知公钥先 Unauthorized，在此放行</b> · 白名单直接过 · 不用输码`;
+    }
+    async function refresh() {
+      const response = await fetch("/api/snapshot", {
+        headers: { "X-HDC-Console-Token": CONSOLE_TOKEN }
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      hostAuth = data.host_auth || "off";
+      applyLede(data);
+      renderNotices(data.notices || []);
+      renderPending(data.pending || []);
+      renderSessions(data.sessions || []);
+      renderDevices(data.devices || []);
+      renderKeys(data.keys || []);
+      const stamp = document.getElementById("stamp");
+      if (!stamp.classList.contains("err") && !stamp.classList.contains("ok")) {
+        stamp.textContent = new Date().toLocaleTimeString();
+      }
+    }
+    document.body.addEventListener("click", (event) => {
+      const copy = event.target.closest("[data-copy]");
+      if (copy) {
+        copyFingerprint(copy.dataset.copy);
+        return;
+      }
+      const button = event.target.closest("button");
+      if (!button || button.disabled) return;
+      if (button.dataset.act === "allow") decide("/api/allow", { request_id: button.dataset.id }, button, { text: "已写入白名单", kind: "ok" });
+      if (button.dataset.act === "once") decide("/api/allow", { request_id: button.dataset.id, once: true }, button, { text: "已放行（仅当次）", kind: "ok" });
+      if (button.dataset.act === "deny") decide("/api/deny", { request_id: button.dataset.id }, button, { text: "已拒绝", kind: "err" });
+      if (button.dataset.fp) decide("/api/revoke", { fingerprint: button.dataset.fp }, button, { text: "已撤销白名单", kind: "err" });
+      if (button.dataset.session) decide("/api/kick", { session_id: button.dataset.session }, button, { text: "已踢出", kind: "ok" });
+      if (button.dataset.notice) decide("/api/dismiss", { notice_id: button.dataset.notice }, button);
+    });
+    refresh();
+    setInterval(refresh, 1500);
+  </script>
+</body>
+</html>
